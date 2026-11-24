@@ -5,6 +5,7 @@
 
 - https://webcast.amemv.com/webcast/room/reflow/info/  按房间号读在线人数
 - https://live.douyin.com/webcast/feed/               公开信息流里正在直播的房间
+  首页热门卡片（source_key=web_homepage_hot_web_live_card）用来按昵称查找
 
 `aid=6383` 和 `app_id=1128` 是网页端公开客户端标识，不是密钥。
 """
@@ -28,6 +29,19 @@ FEED_URL = (
     "https://live.douyin.com/webcast/feed/"
     "?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&channel=test&count=6"
 )
+# 首页热门直播卡片用的同一条公开信息流。不带登录态，一次大约二十个正在直播的房间。
+CATALOG_FEED_URL = (
+    "https://live.douyin.com/webcast/feed/"
+    "?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN"
+    "&channel=channel_pc_web&request_tag_from=web&need_map=1&liveid=1&is_draw=1"
+    "&inner_from_drawer=0&custom_count=50&action=load_more&action_type=loadmore"
+    "&enter_source=web_homepage_hot_web_live_card&source_key=web_homepage_hot_web_live_card"
+)
+NAME_SEARCH_NOTE = (
+    "按昵称在刚拉到的公开直播信息流里查找，不是全站用户搜索，也没有登录。"
+    "正在直播但没出现在这批房间里的人会找不到。同名会都列出来，需要你自己点选。"
+    "在线人数只用接口返回的整数，没有就不显示。"
+)
 REFLOW_URL = (
     "https://webcast.amemv.com/webcast/room/reflow/info/"
     "?type_id=0&live_id=1&app_id=1128&room_id={room_id}"
@@ -45,6 +59,7 @@ _AVATAR_SUFFIXES = (
     "bytegoofy.com",
 )
 _ID_RE = re.compile(r"^[\w.\-]{1,80}$", re.UNICODE)
+_ASCII_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _PACE_MARK = 'self.__pace_f.push([1,"'
 
 
@@ -91,14 +106,35 @@ def parse_count(value: object) -> int | None:
         return None
 
 
+def clean_query(raw: str) -> str:
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", raw or "")
+    return text.strip().strip("，。,.、；;\"'“”‘’")
+
+
+def query_action(raw: str) -> str:
+    """决定输入走原来的直接添加，还是按昵称搜索。
+
+    链接、16 位以上房间号、纯英文数字抖音号仍是直接添加。
+    含中文或其他字符的名字不能当作直播间路径，改走昵称搜索。
+    """
+    text = clean_query(raw)
+    if not text:
+        return "empty"
+    if "://" in text or "douyin.com" in text or "amemv.com" in text:
+        return "direct"
+    token = text[1:].strip() if text.startswith("@") else text
+    if _ASCII_ID_RE.match(token):
+        return "direct"
+    return "name"
+
+
 def parse_query(raw: str) -> dict[str, str]:
     """把用户输入分成房间号、直播间路径或短链。
 
     16 位及以上的纯数字视为一场直播的房间号（接口里的 room_id）。
     更短的纯数字、抖音号，视为 live.douyin.com 后面的那段路径。
     """
-    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", raw or "")
-    text = text.strip().strip("，。,.、；;\"'“”‘’")
+    text = clean_query(raw)
     if not text:
         raise DouyinLookupError("请输入直播间链接、房间号或抖音号")
     if len(text) > 500:
@@ -284,6 +320,62 @@ def normalize_room(room: dict) -> dict:
         "total_user": total_user,
         "web_path": "",
     }
+
+
+def _fold_name(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").casefold()
+
+
+def prepare_catalog_room(room: dict) -> dict | None:
+    """把首页信息流里的一间房整理成可展示的结果。
+
+    这条信息流里正在直播的房间，status 经常是 0，但 room_view_stats 会写「在线观众」。
+    只有看到这个展示文案或 status 为 2 时才标成开播，避免把没给人数的房间说成正在直播。
+    """
+    if not isinstance(room, dict) or room.get("status") == 4:
+        return None
+    snap = normalize_room(room)
+    if not snap.get("room_id") or not snap.get("nickname"):
+        return None
+    owner = room.get("owner") if isinstance(room.get("owner"), dict) else {}
+    if not snap.get("web_path"):
+        snap["web_path"] = str(owner.get("display_id") or owner.get("web_rid") or "")
+    view = room.get("room_view_stats") if isinstance(room.get("room_view_stats"), dict) else {}
+    audience = "在线" in str(view.get("display_long") or "")
+    if snap["status"] == 2 or (audience and isinstance(snap.get("viewer_count"), int)):
+        snap["live"] = True
+    return snap
+
+
+def filter_catalog(snaps: list[dict], keyword: str, limit: int = 12) -> tuple[list[dict], int]:
+    """按昵称包含关系筛选。完全相同优先，其次是开头相同，再按在线人数。"""
+    key = _fold_name(keyword)
+    if not key:
+        return [], 0
+    ranked: list[tuple] = []
+    for snap in snaps:
+        name = _fold_name(str(snap.get("nickname") or ""))
+        if not name or key not in name:
+            continue
+        if name == key:
+            tier = 0
+        elif name.startswith(key):
+            tier = 1
+        else:
+            tier = 2
+        viewers = snap.get("viewer_count")
+        viewer_rank = -viewers if isinstance(viewers, int) else 1
+        ranked.append((tier, viewer_rank, name, snap))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    shown = [item[3] for item in ranked[: max(1, limit)]]
+    return shown, len(ranked)
+
+
+def search_note(scanned: int, total: int, shown: int) -> str:
+    extra = ""
+    if total > shown:
+        extra = f" 匹配到 {total} 个，这里只列出最接近的 {shown} 个。"
+    return f"在 {scanned} 个公开信息流房间里按昵称查找。{NAME_SEARCH_NOTE}{extra}"
 
 
 def _room_score(snap: dict) -> tuple:
@@ -525,3 +617,38 @@ class DouyinClient:
             key=lambda snap: snap["viewer_count"] if snap["viewer_count"] is not None else -1,
             reverse=True,
         )
+
+    def fetch_name_catalog(self, pages: int = 3) -> list[dict]:
+        """拉取首页公开热门直播，供按昵称本地筛选。不访问需要登录的搜索接口。"""
+        self.warm()
+        found: dict[str, dict] = {}
+        maxtime = 0
+        page_count = max(1, min(pages, 4))
+        for index in range(page_count):
+            url = CATALOG_FEED_URL + f"&maxtime={int(maxtime)}"
+            try:
+                data = self._json(url)
+            except DouyinLookupError:
+                if found:
+                    break
+                raise
+            if data.get("status_code") not in (0, None):
+                if found:
+                    break
+                raise DouyinLookupError("昵称搜索暂时不可用")
+            items = data.get("data") if isinstance(data.get("data"), list) else []
+            for item in items:
+                room = item.get("data") if isinstance(item, dict) else None
+                if not isinstance(room, dict):
+                    continue
+                snap = prepare_catalog_room(room)
+                if snap is None:
+                    continue
+                found[snap["room_id"]] = snap
+            extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
+            maxtime = extra.get("max_time") or 0
+            if not extra.get("has_more") or not maxtime:
+                break
+            if index + 1 < page_count:
+                time.sleep(0.25)
+        return list(found.values())

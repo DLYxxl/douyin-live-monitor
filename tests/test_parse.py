@@ -4,10 +4,13 @@ import unittest
 from douyin import (
     DouyinLookupError,
     avatar_host_ok,
+    filter_catalog,
     navigation_host_ok,
     parse_count,
     parse_live_html,
     parse_query,
+    prepare_catalog_room,
+    query_action,
 )
 from server import sort_rooms
 
@@ -115,6 +118,72 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(navigation_host_ok("evil.douyin.com.example"))
         self.assertTrue(avatar_host_ok("p3.douyinpic.com"))
         self.assertFalse(avatar_host_ok("127.0.0.1"))
+
+    def test_name_query_stays_off_the_direct_add_path(self):
+        self.assertEqual(query_action("罗永浩"), "name")
+        self.assertEqual(query_action("  娟娟姐。"), "name")
+        self.assertEqual(query_action("@秋秋🎙️"), "name")
+        self.assertEqual(query_action("你好 世界"), "name")
+        self.assertEqual(query_action(""), "empty")
+        self.assertEqual(query_action("lisa"), "direct")
+        self.assertEqual(query_action("@menghuanyuanzi"), "direct")
+        self.assertEqual(query_action("7711811793449945890"), "direct")
+        self.assertEqual(query_action("https://live.douyin.com/EK17777777"), "direct")
+        self.assertEqual(query_action("https://example.com/123"), "direct")
+        self.assertEqual(parse_query("罗永浩"), {"mode": "web_path", "value": "罗永浩"})
+
+    def test_catalog_match_ranks_exact_name_before_a_busier_partial(self):
+        snaps = [
+            {"nickname": "小娟娟", "viewer_count": 5000, "room_id": "1"},
+            {"nickname": "娟娟", "viewer_count": 3, "room_id": "2"},
+            {"nickname": "别人", "viewer_count": 9, "room_id": "3"},
+            {"nickname": "娟娟姐", "viewer_count": 80, "room_id": "4"},
+            {"nickname": "", "viewer_count": 100, "room_id": "5"},
+        ]
+        matched, total = filter_catalog(snaps, "娟娟", limit=10)
+        self.assertEqual(total, 3)
+        self.assertEqual([item["nickname"] for item in matched], ["娟娟", "娟娟姐", "小娟娟"])
+        self.assertEqual(filter_catalog(snaps, "   ", limit=10), ([], 0))
+
+    def test_catalog_room_uses_audience_text_and_does_not_invent_a_count(self):
+        live = prepare_catalog_room(
+            {
+                "id_str": "7711843011574975232",
+                "status": 0,
+                "title": "伤感情歌",
+                "user_count": 589,
+                "owner": {
+                    "nickname": "秋秋",
+                    "display_id": "32930508987",
+                    "web_rid": "32089583401",
+                },
+                "room_view_stats": {
+                    "display_type": 1,
+                    "display_value": 589,
+                    "display_long": "589在线观众",
+                    "is_hidden": False,
+                },
+            }
+        )
+        self.assertTrue(live["live"])
+        self.assertEqual(live["viewer_count"], 589)
+        self.assertEqual(live["web_path"], "32930508987")
+        self.assertFalse(live["viewer_approximate"])
+        missing = prepare_catalog_room(
+            {
+                "id_str": "7711843011574975233",
+                "status": 0,
+                "title": "没给人数",
+                "owner": {"nickname": "没有人数"},
+            }
+        )
+        self.assertIsNone(missing["viewer_count"])
+        self.assertFalse(missing["live"])
+        self.assertIsNone(
+            prepare_catalog_room(
+                {"id_str": "1", "status": 4, "owner": {"nickname": "已结束"}, "user_count": 10}
+            )
+        )
 
     def test_sort_live_rooms_by_viewers(self):
         ordered = sort_rooms(

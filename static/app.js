@@ -4,6 +4,7 @@ const addButton = document.getElementById("add-button");
 const suggestButton = document.getElementById("suggest-button");
 const refreshButton = document.getElementById("refresh-button");
 const formError = document.getElementById("form-error");
+const nameSearchEl = document.getElementById("name-search");
 const summary = document.getElementById("summary");
 const suggestionsEl = document.getElementById("suggestions");
 const emptyEl = document.getElementById("empty");
@@ -16,6 +17,12 @@ let suggestions = [];
 let suggestionsOpen = false;
 let suggestionsError = "";
 let suggestionsLoading = false;
+let nameSearchOpen = false;
+let nameSearchLoading = false;
+let nameSearchError = "";
+let nameSearchNote = "";
+let nameSearchRooms = [];
+let nameSearchQuery = "";
 let polling = false;
 let renderKey = "";
 
@@ -157,12 +164,12 @@ function renderEmpty(interval) {
   title.textContent = "还没有要盯的直播间";
   const lead = document.createElement("p");
   lead.className = "hint";
-  lead.textContent = "把直播间链接、房间号或抖音号贴到上方。添加成功后会立刻显示真实人数，之后大约每 " + interval + " 秒更新一次。没开播会显示「未开播」，不会把其他房间弄挂。";
+  lead.textContent = "输入主播昵称，或粘贴直播间链接、房间号、抖音号。昵称会在当前公开直播信息流里查找，同名会列出来让你选。添加成功后立刻显示真实人数，之后大约每 " + interval + " 秒更新一次。";
   const steps = document.createElement("ol");
   steps.className = "steps";
   [
-    ["1", "复制直播间地址", "打开 live.douyin.com 上的直播间，复制浏览器地址栏里的链接。"],
-    ["2", "或者只填抖音号", "主播主页上的抖音号也能用。一长串纯数字房间号同样可以。"],
+    ["1", "输入主播昵称", "含中文的名字会按昵称查找。只能找到这次拉到的正在直播的房间，可能漏人。"],
+    ["2", "或粘贴链接、抖音号", "直播间链接、一长串房间号、纯英文数字抖音号仍会直接添加。"],
     ["3", "看人数变化", "开播后这里出现当前在线人数。本次打开期间会留下一小段走势。"],
   ].forEach(([index, heading, body]) => {
     const item = document.createElement("li");
@@ -175,7 +182,7 @@ function renderEmpty(interval) {
   });
   const formats = document.createElement("div");
   formats.className = "formats";
-  ["live.douyin.com/抖音号", "19 位房间号", "v.douyin.com 短链"].forEach((sample) => {
+  ["主播昵称", "live.douyin.com/抖音号", "房间号或短链"].forEach((sample) => {
     const code = document.createElement("code");
     code.textContent = sample;
     formats.append(code);
@@ -445,7 +452,7 @@ async function addQuery(query) {
     setFormError(error.message);
   } finally {
     addButton.disabled = false;
-    addButton.textContent = "添加";
+    refreshAddLabel();
   }
 }
 
@@ -491,16 +498,142 @@ async function loadSuggestions(fresh) {
   }
 }
 
+function isNameQuery(text) {
+  const value = (text || "").trim().replace(/^@/, "");
+  if (!value) return false;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false;
+  if (/douyin\.com|amemv\.com/i.test(value)) return false;
+  return !/^[A-Za-z0-9._-]{1,80}$/.test(value);
+}
+
+function refreshAddLabel() {
+  if (addButton.disabled) return;
+  addButton.textContent = isNameQuery(queryInput.value) ? "查找" : "添加";
+}
+
+function renderNameSearch() {
+  if (!nameSearchOpen) {
+    nameSearchEl.hidden = true;
+    return;
+  }
+  nameSearchEl.hidden = false;
+  nameSearchEl.replaceChildren();
+  const header = document.createElement("header");
+  const title = document.createElement("h2");
+  title.textContent = nameSearchQuery ? "「" + nameSearchQuery + "」的匹配" : "按昵称查找";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "ghost";
+  close.textContent = "收起";
+  close.addEventListener("click", () => {
+    nameSearchOpen = false;
+    renderNameSearch();
+  });
+  header.append(title, close);
+  nameSearchEl.append(header);
+  const note = document.createElement("p");
+  note.className = "suggest-note";
+  if (nameSearchLoading) {
+    note.textContent = "正在读取公开直播信息流，并按昵称查找…";
+    nameSearchEl.append(note);
+    return;
+  }
+  if (nameSearchError) {
+    note.textContent = nameSearchError;
+    nameSearchEl.append(note);
+    return;
+  }
+  note.textContent = nameSearchNote || "没有更多说明。";
+  if (!nameSearchRooms.length) {
+    const empty = document.createElement("p");
+    empty.className = "suggest-note";
+    empty.textContent = "这批公开直播里没有昵称包含「" + nameSearchQuery + "」的房间。对方可能没开播，或不在这次拉到的热门信息流里。可以改用直播间链接或抖音号。";
+    nameSearchEl.append(note, empty);
+    return;
+  }
+  const list = document.createElement("div");
+  list.className = "suggest-list";
+  nameSearchRooms.forEach((match) => {
+    const row = document.createElement("div");
+    row.className = "suggest-row";
+    const who = document.createElement("div");
+    who.className = "who";
+    const name = document.createElement("strong");
+    name.textContent = match.nickname || match.display_id || "未命名";
+    const meta = document.createElement("p");
+    meta.className = "meta";
+    const bits = [];
+    if (match.title) bits.push(match.title);
+    if (match.display_id) bits.push("抖音号 " + match.display_id);
+    if (!match.live) bits.push("开播状态未在信息流里确认");
+    meta.textContent = bits.join("  ·  ");
+    who.append(name, meta);
+    const countEl = document.createElement("div");
+    countEl.className = "suggest-count";
+    if (typeof match.viewer_count === "number") {
+      countEl.textContent = formatNumber(match.viewer_count) + (match.viewer_approximate ? "+" : "") + " 人在看";
+    } else {
+      countEl.textContent = "人数未知";
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.roomId = match.room_id || "";
+    button.dataset.displayId = match.display_id || "";
+    const taken = alreadyWatching(match);
+    button.disabled = taken;
+    button.textContent = taken ? "已在列表" : "添加";
+    button.addEventListener("click", () => addSuggestion(match, button));
+    row.append(avatarNode(match), who, countEl, button);
+    list.append(row);
+  });
+  nameSearchEl.append(note, list);
+}
+
+async function loadNameSearch(query) {
+  nameSearchOpen = true;
+  nameSearchLoading = true;
+  nameSearchError = "";
+  nameSearchNote = "";
+  nameSearchRooms = [];
+  nameSearchQuery = query;
+  renderNameSearch();
+  nameSearchEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  addButton.disabled = true;
+  addButton.textContent = "正在查找…";
+  setFormError("");
+  try {
+    const data = await api("/api/search?q=" + encodeURIComponent(query));
+    nameSearchRooms = data.rooms || [];
+    nameSearchNote = data.note || "";
+    nameSearchError = data.error || "";
+    nameSearchQuery = data.query || query;
+  } catch (error) {
+    nameSearchRooms = [];
+    nameSearchError = error.message;
+  } finally {
+    nameSearchLoading = false;
+    addButton.disabled = false;
+    refreshAddLabel();
+    renderNameSearch();
+  }
+}
+
 addForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const query = queryInput.value.trim();
   if (!query) {
-    setFormError("请先粘贴直播间链接、房间号或抖音号");
+    setFormError("请输入主播昵称，或粘贴直播间链接、房间号、抖音号");
     queryInput.focus();
+    return;
+  }
+  if (isNameQuery(query)) {
+    loadNameSearch(query);
     return;
   }
   addQuery(query);
 });
+
+queryInput.addEventListener("input", refreshAddLabel);
 
 suggestButton.addEventListener("click", () => {
   if (suggestionsOpen && !suggestionsLoading) {

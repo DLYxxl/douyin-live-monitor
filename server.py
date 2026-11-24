@@ -15,7 +15,15 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from douyin import DouyinClient, DouyinLookupError, avatar_host_ok
+from douyin import (
+    DouyinClient,
+    DouyinLookupError,
+    avatar_host_ok,
+    clean_query,
+    filter_catalog,
+    query_action,
+    search_note,
+)
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
@@ -308,6 +316,62 @@ _suggestion_cache: dict = {"at": 0.0, "rooms": []}
 _suggestion_lock = threading.Lock()
 
 
+_catalog_cache: dict = {"at": 0.0, "rooms": []}
+_catalog_lock = threading.Lock()
+
+
+def load_name_catalog(fresh: bool = False) -> list[dict]:
+    now = time.time()
+    with _catalog_lock:
+        if not fresh and _catalog_cache["rooms"] and now - _catalog_cache["at"] < 40:
+            return list(_catalog_cache["rooms"])
+    with net_lock:
+        snaps = client.fetch_name_catalog()
+    with _catalog_lock:
+        _catalog_cache["at"] = time.time()
+        _catalog_cache["rooms"] = snaps
+    return list(snaps)
+
+
+def public_pick(snap: dict) -> dict:
+    return {
+        "room_id": snap.get("room_id") or "",
+        "display_id": snap.get("display_id") or "",
+        "web_path": snap.get("web_path") or snap.get("display_id") or "",
+        "nickname": snap.get("nickname") or "",
+        "avatar": snap.get("avatar") or "",
+        "avatar_urls": [url for url in (snap.get("avatar_urls") or []) if isinstance(url, str)][:3],
+        "title": snap.get("title") or "",
+        "live": bool(snap.get("live")),
+        "viewer_count": snap.get("viewer_count") if isinstance(snap.get("viewer_count"), int) else None,
+        "viewer_approximate": bool(snap.get("viewer_approximate")),
+        "link": room_link(snap),
+    }
+
+
+def search_by_name(keyword: str) -> dict:
+    text = clean_query(keyword)
+    action = query_action(text)
+    if action == "empty":
+        raise DouyinLookupError("请输入主播昵称")
+    if action == "direct":
+        raise DouyinLookupError("这是链接、房间号或抖音号，请直接点添加")
+    if len(text) > 30:
+        raise DouyinLookupError("名字太长了")
+    catalog = load_name_catalog()
+    if not catalog:
+        raise DouyinLookupError("这次没有从公开直播信息流拿到房间")
+    matched, total = filter_catalog(catalog, text)
+    return {
+        "query": text,
+        "scanned": len(catalog),
+        "total": total,
+        "rooms": [public_pick(snap) for snap in matched],
+        "note": search_note(len(catalog), total, len(matched)),
+        "error": None,
+    }
+
+
 def load_suggestions(fresh: bool = False) -> list[dict]:
     now = time.time()
     with _suggestion_lock:
@@ -467,6 +531,15 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/api/state":
             self.send_json(200, state_payload())
+            return
+        if path == "/api/search":
+            keyword = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
+            try:
+                payload = search_by_name(keyword)
+            except DouyinLookupError as error:
+                self.send_json(200, {"query": keyword, "rooms": [], "scanned": 0, "total": 0, "note": "", "error": error.message})
+                return
+            self.send_json(200, payload)
             return
         if path == "/api/suggestions":
             fresh = urllib.parse.parse_qs(parsed.query).get("fresh", ["0"])[0] == "1"
