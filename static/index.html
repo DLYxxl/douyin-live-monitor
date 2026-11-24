@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>抖音直播在线人数</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="page">
+    <header class="top">
+      <div class="brand">
+        <span class="mark" aria-hidden="true"></span>
+        <div>
+          <p class="eyebrow">抖音直播监测</p>
+          <h1>在线人数</h1>
+        </div>
+      </div>
+      <div class="top-actions">
+        <p class="refresh-note" id="refresh-note">大约每 10 秒自动刷新</p>
+        <button type="button" class="ghost" id="refresh-button">立即刷新</button>
+      </div>
+    </header>
+
+    <form id="add-form" class="add-form">
+      <label class="sr-only" for="query">直播间链接、房间号或抖音号</label>
+      <input id="query" name="query" autocomplete="off" spellcheck="false" placeholder="粘贴直播间链接、房间号或抖音号">
+      <div class="add-actions">
+        <button type="submit" id="add-button">添加</button>
+        <button type="button" class="ghost" id="suggest-button">热播推荐</button>
+      </div>
+    </form>
+    <p id="form-error" class="form-error" hidden></p>
+
+    <section id="summary" class="summary" hidden></section>
+    <section id="suggestions" class="suggestions" hidden></section>
+    <section id="empty" class="empty" hidden></section>
+    <p id="boot" class="boot">正在读取本机名单…</p>
+    <section id="list" class="list" aria-label="监测列表"></section>
+
+    <footer class="foot">
+      <p>人数来自抖音公开直播间页面和公开 webcast 接口，不是官方开放平台。抖音改版、限流后可能暂时失败。名单只保存在本机的 data/watchlist.json，不需要登录。</p>
+    </footer>
+  </div>
+  <noscript>
+    <p class="form-error noscript">需要启用 JavaScript 才能使用这个监测页。</p>
+  </noscript>
+  <script src="/static/app.js"></script>
+</body>
+</html>
