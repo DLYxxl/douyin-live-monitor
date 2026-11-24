@@ -403,6 +403,8 @@ a:focus-visible {
 
 .segment-block h3 { margin: 0 0 6px; font-size: 16px; }
 
+.trend-wrap { position: relative; }
+
 .trend {
   width: 100%;
   height: 300px;
@@ -410,6 +412,7 @@ a:focus-visible {
   background: rgba(255, 255, 255, 0.02);
   border-radius: 16px;
   border: 1px solid var(--line);
+  touch-action: none;
 }
 
 .trend polyline { fill: none; stroke: var(--teal); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
@@ -418,9 +421,34 @@ a:focus-visible {
 
 .trend .node { fill: #101114; stroke: var(--teal); stroke-width: 2; }
 
-.trend .count-label { fill: #f3f5f7; font-size: 15px; font-weight: 650; }
+.trend .node.is-active { fill: var(--teal); }
 
-.trend .time-label { fill: #c5ced6; font-size: 14px; }
+.trend .crosshair { stroke: rgba(243, 245, 247, 0.45); stroke-width: 1; stroke-dasharray: 3 3; }
+
+.trend .count-label { fill: #f3f5f7; font-weight: 650; }
+
+.trend .time-label { fill: #c5ced6; }
+
+.trend-tip {
+  position: absolute;
+  z-index: 5;
+  pointer-events: none;
+  min-width: 132px;
+  max-width: 220px;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: #1c222b;
+  box-shadow: var(--shadow);
+}
+
+.trend-tip p { margin: 0; }
+
+.trend-tip .tip-kicker { color: var(--faint); font-size: 12px; }
+
+.trend-tip .tip-count { margin-top: 2px; font-size: 20px; font-weight: 680; font-variant-numeric: tabular-nums; }
+
+.trend-tip .tip-note { margin-top: 4px; color: var(--muted); font-size: 12px; }
 
 .back-list { display: none; }
 

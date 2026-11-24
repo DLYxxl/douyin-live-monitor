@@ -273,13 +273,16 @@ function svgEl(name, attrs) {
 }
 
 function detailChart(history) {
+  const wrap = document.createElement("div");
+  wrap.className = "trend-wrap";
   const svg = svgEl("svg", { viewBox: "0 0 640 300", class: "trend", role: "img" });
   const usable = (history || []).filter((point) => typeof point.count === "number" && typeof point.t === "number");
   const axisY = 214;
   svg.append(svgEl("line", { class: "axis", x1: "36", x2: "604", y1: String(axisY), y2: String(axisY) }));
+  wrap.append(svg);
   if (usable.length < 2) {
     svg.setAttribute("aria-label", "采样点还不够，暂时画不出走势");
-    return svg;
+    return wrap;
   }
   const left = 36;
   const right = 604;
@@ -292,7 +295,8 @@ function detailChart(history) {
   const min = Math.min(...counts);
   const max = Math.max(...counts);
   const countSpan = Math.max(1, max - min);
-  const coords = usable.map((point) => ({
+  const coords = usable.map((point, index) => ({
+    index: index,
     t: point.t,
     count: point.count,
     approximate: Boolean(point.approximate),
@@ -300,72 +304,171 @@ function detailChart(history) {
     y: bottom - ((point.count - min) / countSpan) * (bottom - top),
   }));
   svg.append(svgEl("polyline", { points: coords.map((point) => point.x.toFixed(1) + "," + point.y.toFixed(1)).join(" ") }));
-  const spacing = (right - left) / Math.max(1, coords.length - 1);
-  const labeled = new Set();
-  if (spacing >= 52) {
-    coords.forEach((_, index) => labeled.add(index));
-  } else {
-    labeled.add(0);
-    labeled.add(coords.length - 1);
-    let peak = coords.findIndex((point) => !point.approximate);
-    if (peak < 0) peak = 0;
-    coords.forEach((point, index) => {
-      const betterExact = !point.approximate && (coords[peak].approximate || point.count >= coords[peak].count);
-      const betterApprox = point.approximate && coords[peak].approximate && point.count >= coords[peak].count;
-      if (betterExact || betterApprox) peak = index;
-    });
-    labeled.add(peak);
-    const step = Math.max(1, Math.ceil(coords.length / 6));
-    for (let index = 0; index < coords.length; index += step) labeled.add(index);
-    const ordered = [...labeled].sort((a, b) => coords[a].x - coords[b].x);
-    let lastX = -999;
-    ordered.forEach((index) => {
-      const must = index === 0 || index === coords.length - 1 || index === peak;
-      if (!must && coords[index].x - lastX < 52) {
-        labeled.delete(index);
-        return;
-      }
-      lastX = coords[index].x;
-    });
-  }
+  const layout = chartLayout;
+  const countFont = 15;
+  const countHeight = 18;
+  let peak = coords.findIndex((point) => !point.approximate);
+  if (peak < 0) peak = 0;
   coords.forEach((point, index) => {
-    const dot = svgEl("circle", { cx: point.x.toFixed(1), cy: point.y.toFixed(1), r: "3.5", class: "node" });
-    const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
-    tip.textContent = chartTime(point.t, true) + "  " + countLabel(point) + (point.approximate ? "（约数，不是精确整数）" : " 人");
-    dot.append(tip);
+    const betterExact = !point.approximate && (coords[peak].approximate || point.count >= coords[peak].count);
+    const betterApprox = point.approximate && coords[peak].approximate && point.count >= coords[peak].count;
+    if (betterExact || betterApprox) peak = index;
+  });
+  const maxCountWidth = Math.max.apply(null, coords.map((point) => layout.textWidth(countLabel(point), countFont)));
+  const slot = maxCountWidth + 14;
+  const innerLeft = left + maxCountWidth / 2;
+  const innerRight = right - maxCountWidth / 2;
+  const slotCount = Math.max(1, Math.floor((innerRight - innerLeft) / slot) + 1);
+  const targets = [];
+  for (let index = 0; index < slotCount; index += 1) {
+    targets.push(slotCount === 1 ? (innerLeft + innerRight) / 2 : innerLeft + ((innerRight - innerLeft) * index) / (slotCount - 1));
+  }
+  const countCandidates = [];
+  function addCountCandidate(point, priority) {
+    const width = layout.textWidth(countLabel(point), countFont);
+    let box = layout.boxFor(point.x, Math.max(16, point.y - 8), width, countHeight, "middle");
+    if (box.left < 4) box = layout.boxFor(4 + width / 2, box.bottom, width, countHeight, "middle");
+    if (box.right > 636) box = layout.boxFor(636 - width / 2, box.bottom, width, countHeight, "middle");
+    countCandidates.push({ id: point.index, priority: priority, box: box, point: point });
+  }
+  addCountCandidate(coords[peak], 100);
+  const used = new Set([peak]);
+  targets.forEach((target) => {
+    let best = null;
+    let bestDistance = Infinity;
+    coords.forEach((point) => {
+      if (used.has(point.index)) return;
+      const distance = Math.abs(point.x - target);
+      if (distance < bestDistance) {
+        best = point;
+        bestDistance = distance;
+      }
+    });
+    if (!best || bestDistance > slot) return;
+    used.add(best.index);
+    addCountCandidate(best, 60);
+  });
+  const visibleCounts = new Set(layout.chooseLabels(countCandidates));
+  coords.forEach((point) => {
+    const dot = svgEl("circle", { cx: point.x.toFixed(1), cy: point.y.toFixed(1), r: "3.5", class: "node", "data-index": String(point.index) });
     svg.append(dot);
-    if (!labeled.has(index)) return;
-    const anchor = index === 0 ? "start" : index === coords.length - 1 ? "end" : "middle";
+    if (!visibleCounts.has(point.index)) return;
+    const chosen = countCandidates.find((item) => item.id === point.index && visibleCounts.has(item.id));
     const label = svgEl("text", {
-      x: point.x.toFixed(1),
-      y: Math.max(14, point.y - 10).toFixed(1),
-      "text-anchor": anchor,
+      x: ((chosen.box.left + chosen.box.right) / 2).toFixed(1),
+      y: chosen.box.bottom.toFixed(1),
+      "text-anchor": "middle",
       class: "count-label",
+      "font-size": String(countFont),
+      "data-priority": point.index === peak ? "100" : "60",
     });
     label.textContent = countLabel(point);
     svg.append(label);
   });
   const withSeconds = timeSpan < 600;
-  const tickCount = timeSpan >= 240 ? 5 : 4;
-  let previousTick = -999;
+  const timeFont = 14;
+  const tickCount = Math.max(2, Math.min(5, Math.floor((right - left) / (layout.textWidth(chartTime(start, withSeconds), timeFont) + 16)) + 1));
+  const timeCandidates = [];
   for (let index = 0; index < tickCount; index += 1) {
-    const tick = start + (timeSpan * index) / (tickCount - 1);
+    const tick = start + (timeSpan * index) / Math.max(1, tickCount - 1);
     const x = left + ((tick - start) / timeSpan) * (right - left);
-    const edge = index === 0 || index === tickCount - 1;
-    if (!edge && x - previousTick < 78) continue;
-    previousTick = x;
-    svg.append(svgEl("line", { class: "tick", x1: x.toFixed(1), x2: x.toFixed(1), y1: String(axisY), y2: String(axisY + 6) }));
-    const timeLabel = svgEl("text", {
-      x: x.toFixed(1),
-      y: "246",
-      "text-anchor": index === 0 ? "start" : index === tickCount - 1 ? "end" : "middle",
-      class: "time-label",
+    const anchor = index === 0 ? "start" : index === tickCount - 1 ? "end" : "middle";
+    const text = chartTime(tick, withSeconds);
+    const width = layout.textWidth(text, timeFont);
+    timeCandidates.push({
+      id: "t" + index,
+      priority: index === 0 || index === tickCount - 1 ? 100 : 50,
+      box: layout.boxFor(x, 262, width, 16, anchor),
+      x: x,
+      anchor: anchor,
+      text: text,
     });
-    timeLabel.textContent = chartTime(tick, withSeconds);
-    svg.append(timeLabel);
   }
-  svg.setAttribute("aria-label", "本机采样的在线人数，从 " + formatNumber(min) + " 到 " + formatNumber(max));
-  return svg;
+  const visibleTimes = new Set(layout.chooseLabels(timeCandidates));
+  timeCandidates.forEach((tick) => {
+    if (!visibleTimes.has(tick.id)) return;
+    svg.append(svgEl("line", { class: "tick", x1: tick.x.toFixed(1), x2: tick.x.toFixed(1), y1: String(axisY), y2: String(axisY + 6) }));
+    const timeLabel = svgEl("text", {
+      x: tick.x.toFixed(1),
+      y: "262",
+      "text-anchor": tick.anchor,
+      class: "time-label",
+      "font-size": String(timeFont),
+      "data-priority": String(tick.priority),
+    });
+    timeLabel.textContent = tick.text;
+    svg.append(timeLabel);
+  });
+  const crosshair = svgEl("line", { class: "crosshair", x1: "0", x2: "0", y1: String(top), y2: String(axisY), visibility: "hidden" });
+  const active = svgEl("circle", { class: "node is-active", cx: "0", cy: "0", r: "5.5", visibility: "hidden" });
+  svg.append(crosshair, active);
+  const tip = document.createElement("div");
+  tip.className = "trend-tip";
+  tip.hidden = true;
+  wrap.append(tip);
+  function hideTip() {
+    tip.hidden = true;
+    crosshair.setAttribute("visibility", "hidden");
+    active.setAttribute("visibility", "hidden");
+  }
+  svg.addEventListener("pointermove", (event) => {
+    const rect = svg.getBoundingClientRect();
+    if (!rect.width) return;
+    const viewX = ((event.clientX - rect.left) / rect.width) * 640;
+    if (viewX < left - 8 || viewX > right + 8) {
+      hideTip();
+      return;
+    }
+    const nearest = layout.nearestByX(coords, viewX);
+    crosshair.setAttribute("visibility", "visible");
+    crosshair.setAttribute("x1", nearest.x.toFixed(1));
+    crosshair.setAttribute("x2", nearest.x.toFixed(1));
+    active.setAttribute("visibility", "visible");
+    active.setAttribute("cx", nearest.x.toFixed(1));
+    active.setAttribute("cy", nearest.y.toFixed(1));
+    tip.replaceChildren();
+    const kicker = document.createElement("p");
+    kicker.className = "tip-kicker";
+    kicker.textContent = "最近一次记录";
+    const when = document.createElement("p");
+    when.textContent = chartTime(nearest.t, true);
+    const value = document.createElement("p");
+    value.className = "tip-count";
+    value.textContent = countLabel(nearest) + " 人";
+    tip.append(kicker, when, value);
+    if (nearest.approximate) {
+      const note = document.createElement("p");
+      note.className = "tip-note";
+      note.textContent = "这是约数，不是精确整数。没有在两次采样之间估人数。";
+      tip.append(note);
+    }
+    tip.hidden = false;
+    const wrapRect = wrap.getBoundingClientRect();
+    const localX = event.clientX - wrapRect.left + 14;
+    const localY = event.clientY - wrapRect.top - 12;
+    tip.style.left = Math.min(Math.max(8, localX), wrapRect.width - 150) + "px";
+    tip.style.top = Math.max(8, localY) + "px";
+  });
+  svg.addEventListener("pointerleave", hideTip);
+  svg.setAttribute("aria-label", "本机采样的在线人数，从 " + formatNumber(min) + " 到 " + formatNumber(max) + "。鼠标移到图上会显示最近一次真实采样。");
+  requestAnimationFrame(function dropOverlaps() {
+    if (!svg.isConnected) {
+      requestAnimationFrame(dropOverlaps);
+      return;
+    }
+    const labels = [...svg.querySelectorAll(".count-label, .time-label")];
+    const items = labels.map((el) => ({ el: el, box: el.getBBox(), priority: Number(el.dataset.priority || 0) }));
+    items.sort((a, b) => b.priority - a.priority);
+    const kept = [];
+    items.forEach((item) => {
+      if (kept.some((other) => layout.intersects(item.box, other.box, 2))) {
+        item.el.remove();
+        return;
+      }
+      kept.push(item);
+    });
+  });
+  return wrap;
 }
 
 function metricTile(title, value, note, unavailable) {
@@ -506,7 +609,7 @@ function renderDetail(rooms) {
   if (segments.length >= 2) {
     const span = document.createElement("p");
     span.className = "metric-note";
-    span.textContent = clock(segments[0].t) + " – " + clock(segments[segments.length - 1].t) + "，共 " + segments.length + " 个采样。";
+    span.textContent = clock(segments[0].t) + " – " + clock(segments[segments.length - 1].t) + "，共 " + segments.length + " 个采样。固定数字只标在隔得开的时间上。鼠标在图里移动，显示离指针最近的一次真实采样，不会在两点之间估人数。";
     viewersBlock.append(span);
   }
 
