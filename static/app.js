@@ -8,7 +8,9 @@ const nameSearchEl = document.getElementById("name-search");
 const summary = document.getElementById("summary");
 const suggestionsEl = document.getElementById("suggestions");
 const emptyEl = document.getElementById("empty");
+const stageEl = document.getElementById("stage");
 const listEl = document.getElementById("list");
+const detailEl = document.getElementById("detail");
 const bootEl = document.getElementById("boot");
 const refreshNote = document.getElementById("refresh-note");
 
@@ -23,6 +25,8 @@ let nameSearchError = "";
 let nameSearchNote = "";
 let nameSearchRooms = [];
 let nameSearchQuery = "";
+let selectedId = "";
+let pinSelection = false;
 let polling = false;
 let renderKey = "";
 
@@ -198,12 +202,117 @@ function renderEmpty(interval) {
   emptyEl.append(title, lead, steps, formats, actions);
 }
 
-function renderCard(room, index) {
-  const card = document.createElement("article");
-  card.className = "card" + (room.live ? " is-live" : "");
+function formatDuration(seconds) {
+  const whole = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(whole / 3600);
+  const minutes = Math.floor((whole % 3600) / 60);
+  const remain = whole % 60;
+  if (hours) return hours + "小时" + minutes + "分";
+  if (minutes) return minutes + "分" + remain + "秒";
+  return remain + "秒";
+}
 
-  const top = document.createElement("div");
-  top.className = "card-top";
+function renderRoster(rooms) {
+  listEl.replaceChildren();
+  rooms.forEach((room) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "roster-row" + (room.id === selectedId ? " is-selected" : "");
+    button.setAttribute("aria-pressed", room.id === selectedId ? "true" : "false");
+    const who = document.createElement("div");
+    who.className = "who";
+    const name = document.createElement("p");
+    name.className = "roster-name";
+    name.textContent = room.nickname || room.display_id || room.query || "未命名直播间";
+    const meta = document.createElement("p");
+    meta.className = "meta";
+    meta.textContent = room.live ? "开播" : "未开播";
+    who.append(name, meta);
+    const count = document.createElement("div");
+    count.className = "roster-count";
+    if (room.live && typeof room.viewer_count === "number") {
+      count.textContent = formatNumber(room.viewer_count);
+    } else if (room.live) {
+      count.textContent = "—";
+    } else {
+      count.textContent = "未开播";
+    }
+    button.append(avatarNode(room), who, count);
+    button.addEventListener("click", () => {
+      pinSelection = false;
+      selectedId = room.id;
+      renderRoster(latestRooms);
+      renderDetail(latestRooms);
+    });
+    listEl.append(button);
+  });
+}
+
+function detailChart(history) {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", "0 0 640 220");
+  svg.setAttribute("class", "trend");
+  svg.setAttribute("role", "img");
+  const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  axis.setAttribute("class", "axis");
+  axis.setAttribute("x1", "16");
+  axis.setAttribute("x2", "624");
+  axis.setAttribute("y1", "188");
+  axis.setAttribute("y2", "188");
+  svg.append(axis);
+  if (!history || history.length < 2) {
+    svg.setAttribute("aria-label", "采样点还不够，暂时画不出走势");
+    return svg;
+  }
+  const counts = history.map((point) => point.count);
+  const min = Math.min(...counts);
+  const max = Math.max(...counts);
+  const span = Math.max(1, max - min);
+  const points = history.map((point, index) => {
+    const x = 16 + (index / (history.length - 1)) * 608;
+    const y = 176 - ((point.count - min) / span) * 150;
+    return x.toFixed(1) + "," + y.toFixed(1);
+  });
+  const poly = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  poly.setAttribute("points", points.join(" "));
+  svg.append(poly);
+  svg.setAttribute("aria-label", "本机采样的在线人数，从 " + formatNumber(min) + " 到 " + formatNumber(max));
+  return svg;
+}
+
+function metricTile(title, value, note, unavailable) {
+  const tile = document.createElement("article");
+  tile.className = "metric-tile" + (unavailable ? " is-unavailable" : "");
+  const heading = document.createElement("h3");
+  heading.textContent = title;
+  const number = document.createElement("p");
+  number.className = "metric-value";
+  number.textContent = value;
+  tile.append(heading, number);
+  if (note) {
+    const paragraph = document.createElement("p");
+    paragraph.className = "metric-note";
+    paragraph.textContent = note;
+    tile.append(paragraph);
+  }
+  return tile;
+}
+
+function renderDetail(rooms) {
+  const room = rooms.find((item) => item.id === selectedId);
+  if (!room) {
+    detailEl.hidden = true;
+    stageEl.classList.remove("is-open");
+    detailEl.replaceChildren();
+    return;
+  }
+  detailEl.hidden = false;
+  stageEl.classList.add("is-open");
+  const detail = room.detail || {};
+  detailEl.replaceChildren();
+
+  const head = document.createElement("div");
+  head.className = "detail-head";
   const who = document.createElement("div");
   who.className = "who";
   const nameRow = document.createElement("div");
@@ -223,58 +332,97 @@ function renderCard(room, index) {
   meta.className = "meta";
   const bits = [];
   if (room.display_id) bits.push("抖音号 " + room.display_id);
-  else if (room.web_path) bits.push(room.web_path);
-  bits.push(String(index + 1).padStart(2, "0"));
+  if (room.title) bits.push(room.title);
   meta.textContent = bits.join("  ·  ");
   who.append(nameRow, meta);
+  const actions = document.createElement("div");
+  actions.className = "detail-actions";
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "ghost back-list";
+  back.textContent = "返回列表";
+  back.addEventListener("click", () => {
+    pinSelection = true;
+    selectedId = "";
+    renderList(latestRooms);
+  });
   const remove = document.createElement("button");
   remove.type = "button";
   remove.className = "remove";
   remove.textContent = "移出";
   remove.addEventListener("click", () => removeRoom(room.id));
-  top.append(avatarNode(room), who, remove);
+  actions.append(back, remove);
+  head.append(avatarNode(room), who, actions);
 
-  const title = document.createElement("p");
-  title.className = "title";
-  title.textContent = room.title || (room.live ? "直播间没有标题" : "当前没有进行中的直播");
-
-  const metric = document.createElement("div");
-  metric.className = "metric";
-  const figures = document.createElement("div");
   const kicker = document.createElement("p");
   kicker.className = "kicker";
   kicker.textContent = room.live ? "当前在线" : "直播状态";
   const viewers = document.createElement("p");
-  viewers.className = "viewers";
+  viewers.className = "hero-count" + (room.live && typeof room.viewer_count === "number" ? "" : " quiet");
   if (room.live && typeof room.viewer_count === "number") {
     viewers.textContent = formatNumber(room.viewer_count) + (room.viewer_approximate ? "+" : "");
   } else if (room.live) {
-    viewers.classList.add("quiet");
     viewers.textContent = "暂无人数";
   } else {
-    viewers.classList.add("quiet");
     viewers.textContent = "未开播";
   }
-  figures.append(kicker, viewers);
-  const delta = deltaOf(room.history);
-  if (room.live && delta) {
-    const deltaLine = document.createElement("p");
-    deltaLine.className = "delta " + delta.kind;
-    deltaLine.textContent = delta.text;
-    figures.append(deltaLine);
-  } else if (room.live) {
-    const deltaLine = document.createElement("p");
-    deltaLine.className = "delta";
-    deltaLine.textContent = "走势会在后续刷新里出现";
-    figures.append(deltaLine);
+
+  const grid = document.createElement("div");
+  grid.className = "metric-grid";
+  grid.append(
+    metricTile(
+      "今日新增粉丝",
+      "公开数据里没有这项",
+      detail.today_followers_reason || "没有自然日的新增粉丝。",
+      true
+    )
+  );
+  if (typeof detail.session_follows === "number") {
+    grid.append(metricTile("本场新增关注", formatNumber(detail.session_follows), "来自公开房间数据里的 follow_count，只计这一场开播之后，不是今天全天。", false));
+  } else {
+    grid.append(metricTile("本场新增关注", "这次没拿到", "房间接口没有返回 follow_count。", true));
   }
-  if (room.live && typeof room.total_user === "number" && room.total_user > 0) {
-    const total = document.createElement("p");
-    total.className = "total";
-    total.textContent = "本场累计 " + formatNumber(room.total_user);
-    figures.append(total);
+  if (typeof detail.live_seconds === "number") {
+    const started = detail.started_at ? clock(detail.started_at) + " 开播" : "";
+    grid.append(metricTile("直播时间", formatDuration(detail.live_seconds), started ? "按公开房间的 start_time 算到现在。" + started + "。" : "按公开房间的 start_time 算到现在。", false));
+  } else {
+    grid.append(metricTile("直播时间", room.live ? "没有开播时间" : "当前没有进行中的直播", room.live ? "这次的房间数据里没有可用的 start_time。" : "未开播时不估算上一场时长。", true));
   }
-  metric.append(figures, sparkline(room.history));
+  if (typeof detail.like_count === "number") {
+    grid.append(metricTile("点赞", formatNumber(detail.like_count), "来自公开房间上的 like_count。同一接口里 stats.like_count 一直是 0，没有采用。", false));
+  } else {
+    grid.append(metricTile("点赞", "这次没拿到", "房间数据里没有 like_count。", true));
+  }
+  if (typeof detail.observed_peak === "number") {
+    grid.append(metricTile("本机看到的最高在线", formatNumber(detail.observed_peak), "只取这次打开后本机采样和当前人数里的最大值，不是抖音公布的整场峰值。", false));
+  } else {
+    grid.append(metricTile("本机看到的最高在线", "还没有采样", "加入名单并刷新到整数在线人数后才会有。", true));
+  }
+
+  const viewersBlock = document.createElement("section");
+  viewersBlock.className = "segment-block";
+  const viewersTitle = document.createElement("h3");
+  viewersTitle.textContent = "直播时间段的人数";
+  const viewersNote = document.createElement("p");
+  viewersNote.className = "metric-note";
+  viewersNote.textContent = detail.viewer_segments_note || "";
+  const segments = Array.isArray(detail.viewer_segments) ? detail.viewer_segments : room.history || [];
+  viewersBlock.append(viewersTitle, viewersNote, detailChart(segments));
+  if (segments.length >= 2) {
+    const span = document.createElement("p");
+    span.className = "metric-note";
+    span.textContent = clock(segments[0].t) + " – " + clock(segments[segments.length - 1].t) + "，共 " + segments.length + " 个采样。";
+    viewersBlock.append(span);
+  }
+
+  const giftBlock = document.createElement("section");
+  giftBlock.className = "segment-block";
+  const giftTitle = document.createElement("h3");
+  giftTitle.textContent = "时间段礼物数量";
+  const giftNote = document.createElement("p");
+  giftNote.className = "metric-note";
+  giftNote.textContent = detail.gift_reason || "没有可用的礼物分段。";
+  giftBlock.append(giftTitle, giftNote);
 
   const foot = document.createElement("div");
   foot.className = "card-foot";
@@ -289,20 +437,29 @@ function renderCard(room, index) {
     link.textContent = "打开直播间";
     foot.append(link);
   }
-
-  card.append(top, title, metric, foot);
+  detailEl.append(head, kicker, viewers, grid, viewersBlock, giftBlock, foot);
   if (room.error) {
     const warn = document.createElement("p");
     warn.className = "warn";
-    warn.textContent = room.nickname ? "暂时没刷新成功，仍显示上次结果：" + room.error : room.error;
-    card.append(warn);
+    warn.textContent = room.error;
+    detailEl.append(warn);
   }
-  return card;
 }
 
 function renderList(rooms) {
-  listEl.replaceChildren();
-  rooms.forEach((room, index) => listEl.append(renderCard(room, index)));
+  if (!rooms.length) {
+    stageEl.hidden = true;
+    detailEl.hidden = true;
+    stageEl.classList.remove("is-open");
+    listEl.replaceChildren();
+    return;
+  }
+  stageEl.hidden = false;
+  if (!rooms.some((room) => room.id === selectedId)) {
+    selectedId = pinSelection ? "" : rooms[0].id;
+  }
+  renderRoster(rooms);
+  renderDetail(rooms);
 }
 
 function alreadyWatching(suggestion) {
@@ -416,8 +573,11 @@ function render(state) {
   }
   renderKey = key;
   renderSummary(latestRooms);
-  if (!latestRooms.length) renderEmpty(interval);
-  else emptyEl.hidden = true;
+  if (!latestRooms.length) {
+    selectedId = "";
+    pinSelection = false;
+    renderEmpty(interval);
+  } else emptyEl.hidden = true;
   renderList(latestRooms);
   syncSuggestionButtons();
 }

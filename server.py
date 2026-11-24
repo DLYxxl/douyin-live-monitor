@@ -16,6 +16,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from douyin import (
+    GIFT_SEGMENTS_UNAVAILABLE,
+    TODAY_FOLLOWERS_UNAVAILABLE,
+    VIEWER_SEGMENTS_NOTE,
     DouyinClient,
     DouyinLookupError,
     avatar_host_ok,
@@ -30,7 +33,7 @@ STATIC = ROOT / "static"
 DATA_PATH = ROOT / "data" / "watchlist.json"
 MAX_ROOMS = 20
 DEFAULT_INTERVAL = 10
-HISTORY_LIMIT = 36
+HISTORY_LIMIT = 180
 
 rooms: list[dict] = []
 histories: dict[str, list[dict]] = {}
@@ -130,6 +133,33 @@ def public_room(item: dict) -> dict:
         "added_at": item.get("added_at"),
         "link": room_link(item),
         "history": history,
+        "detail": room_detail(item, history),
+    }
+
+
+def room_detail(item: dict, history: list[dict]) -> dict:
+    now = time.time()
+    started = item.get("started_at")
+    live_seconds = None
+    if item.get("live") and isinstance(started, int) and 1_000_000_000 <= started <= now + 120:
+        live_seconds = max(0, int(now - started))
+    counts = [point["count"] for point in history if isinstance(point.get("count"), int)]
+    if isinstance(item.get("viewer_count"), int):
+        counts.append(item["viewer_count"])
+    follows = item.get("session_follows")
+    likes = item.get("like_count")
+    return {
+        "started_at": started if isinstance(started, int) else None,
+        "live_seconds": live_seconds,
+        "session_follows": follows if isinstance(follows, int) else None,
+        "today_followers": None,
+        "today_followers_reason": TODAY_FOLLOWERS_UNAVAILABLE,
+        "like_count": likes if isinstance(likes, int) else None,
+        "gift_segments": None,
+        "gift_reason": GIFT_SEGMENTS_UNAVAILABLE,
+        "viewer_segments": history,
+        "viewer_segments_note": VIEWER_SEGMENTS_NOTE,
+        "observed_peak": max(counts) if counts else None,
     }
 
 
@@ -156,6 +186,8 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     new_room = str(snap.get("room_id") or "")
     if previous_room and new_room and previous_room != new_room:
         histories[item["id"]] = []
+        for field in ("started_at", "session_follows", "like_count"):
+            item.pop(field, None)
     for field in ("room_id", "display_id", "nickname", "avatar", "title", "web_path"):
         value = snap.get(field)
         if field == "web_path":
@@ -171,6 +203,9 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     item["viewer_count"] = snap.get("viewer_count")
     item["viewer_approximate"] = bool(snap.get("viewer_approximate"))
     item["total_user"] = snap.get("total_user")
+    for field in ("started_at", "session_follows", "like_count"):
+        if snap.get(field) is not None:
+            item[field] = snap[field]
     item["_offline_ticks"] = snap.get("_offline_ticks", item.get("_offline_ticks", 0))
     item["error"] = None
     item["updated_at"] = time.time()
@@ -218,6 +253,9 @@ def add_room(query: str) -> dict:
         "viewer_count": snap.get("viewer_count"),
         "viewer_approximate": bool(snap.get("viewer_approximate")),
         "total_user": snap.get("total_user"),
+        "started_at": snap.get("started_at"),
+        "session_follows": snap.get("session_follows"),
+        "like_count": snap.get("like_count"),
         "error": None,
         "updated_at": now,
         "added_at": now,

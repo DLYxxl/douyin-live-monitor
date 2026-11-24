@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from douyin import (
@@ -11,7 +12,9 @@ from douyin import (
     parse_query,
     prepare_catalog_room,
     query_action,
+    session_metrics,
 )
+from server import room_detail
 from server import sort_rooms
 
 
@@ -184,6 +187,40 @@ class ParseTests(unittest.TestCase):
                 {"id_str": "1", "status": 4, "owner": {"nickname": "已结束"}, "user_count": 10}
             )
         )
+
+    def test_session_metrics_keep_follows_and_likes_but_not_zeroed_gifts(self):
+        metrics = session_metrics(
+            {
+                "start_time": 1795556003,
+                "like_count": 3251,
+                "stats": {"follow_count": 106, "like_count": 0, "gift_uv_count": 0, "fan_ticket": 0},
+            }
+        )
+        self.assertEqual(metrics["started_at"], 1795556003)
+        self.assertEqual(metrics["session_follows"], 106)
+        self.assertEqual(metrics["like_count"], 3251)
+        self.assertIsNone(metrics["gift_count"])
+
+    def test_detail_does_not_invent_today_followers_or_gift_segments(self):
+        detail = room_detail(
+            {
+                "live": True,
+                "started_at": int(time.time()) - 125,
+                "session_follows": 4,
+                "like_count": 9,
+                "viewer_count": 20,
+            },
+            [{"t": 1, "count": 10}, {"t": 2, "count": 20}],
+        )
+        self.assertIsNone(detail["today_followers"])
+        self.assertIsNone(detail["gift_segments"])
+        self.assertIn("自然日", detail["today_followers_reason"])
+        self.assertIn("礼物", detail["gift_reason"])
+        self.assertEqual(detail["session_follows"], 4)
+        self.assertGreaterEqual(detail["live_seconds"], 120)
+        self.assertEqual(detail["observed_peak"], 20)
+        offline = room_detail({"live": False, "started_at": int(time.time()) - 500}, [])
+        self.assertIsNone(offline["live_seconds"])
 
     def test_sort_live_rooms_by_viewers(self):
         ordered = sort_rooms(

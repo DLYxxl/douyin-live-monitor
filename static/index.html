@@ -38,7 +38,10 @@
     <section id="suggestions" class="suggestions" hidden></section>
     <section id="empty" class="empty" hidden></section>
     <p id="boot" class="boot">正在读取本机名单…</p>
-    <section id="list" class="list" aria-label="监测列表"></section>
+    <div id="stage" class="stage" hidden>
+      <section id="list" class="roster" aria-label="监测列表"></section>
+      <section id="detail" class="detail" hidden></section>
+    </div>
 
     <footer class="foot">
       <p>人数来自抖音公开直播间页面和公开 webcast 接口，不是官方开放平台。按昵称查找只覆盖刚拉到的一小批公开热门直播，会漏人，也不会编造匹配或人数。抖音改版、限流后可能暂时失败。名单只保存在本机的 data/watchlist.json，不需要登录。</p>

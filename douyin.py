@@ -322,6 +322,53 @@ def normalize_room(room: dict) -> dict:
     }
 
 
+TODAY_FOLLOWERS_UNAVAILABLE = (
+    "公开房间接口没有「自然日新增粉丝」。"
+    "stats.follow_count 只是这一场开播之后的新增关注，不能当成今天全天的新增。"
+)
+GIFT_SEGMENTS_UNAVAILABLE = (
+    "公开房间接口没有按时间段统计的礼物。"
+    "未登录时 gift_uv_count 和 fan_ticket 在正在直播、而且很热闹的房间里也一直是 0，不能把 0 显示成礼物数。"
+)
+VIEWER_SEGMENTS_NOTE = (
+    "这些点是本机每次刷新记下的在线人数，按时间排开。"
+    "抖音这条公开接口不提供整场的人数分段，程序没开着的时段这里是空的。"
+)
+
+
+def _plain_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def session_metrics(room: dict) -> dict:
+    """从公开房间对象里取出能核对的场次数字。
+
+    礼物相关字段在未登录的 reflow 接口里对热门直播也恒为 0，0 不当作真实礼物数。
+    点赞用房间上的 like_count；stats.like_count 在这条接口里恒为 0。
+    """
+    if not isinstance(room, dict):
+        return {"started_at": None, "session_follows": None, "like_count": None}
+    stats = room.get("stats") if isinstance(room.get("stats"), dict) else {}
+    started = _plain_int(room.get("start_time")) or _plain_int(room.get("create_time"))
+    if started is not None and started < 1_000_000_000:
+        started = None
+    gift_uv = _plain_int(stats.get("gift_uv_count"))
+    ticket = _plain_int(stats.get("fan_ticket"))
+    gift_count = gift_uv if gift_uv and gift_uv > 0 else None
+    if gift_count is None and ticket and ticket > 0:
+        gift_count = ticket
+    return {
+        "started_at": started,
+        "session_follows": _plain_int(stats.get("follow_count")),
+        "like_count": _plain_int(room.get("like_count")),
+        "gift_count": gift_count,
+    }
+
+
 def _fold_name(text: str) -> str:
     return re.sub(r"\s+", "", text or "").casefold()
 
@@ -486,6 +533,7 @@ class DouyinClient:
         if status_code not in (0, None) or not isinstance(room, dict) or not (room.get("id_str") or room.get("id")):
             raise DouyinLookupError("没有找到这个房间号")
         snap = normalize_room(room)
+        snap.update(session_metrics(room))
         if snap.get("display_id"):
             snap["web_path"] = snap["display_id"]
         return snap
@@ -517,6 +565,9 @@ class DouyinClient:
             if rich:
                 for field in ("nickname", "display_id", "avatar", "title"):
                     if rich.get(field):
+                        snap[field] = rich[field]
+                for field in ("started_at", "session_follows", "like_count", "gift_count"):
+                    if rich.get(field) is not None:
                         snap[field] = rich[field]
                 snap["live"] = rich["live"]
                 snap["status"] = rich["status"]
