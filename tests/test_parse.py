@@ -293,6 +293,17 @@ class ParseTests(unittest.TestCase):
         thinned = _thin_samples(crowded)
         self.assertLess(len(thinned), len(crowded))
         self.assertEqual(max(sample["viewers"] for sample in thinned), 50)
+        marked = {}
+        self.assertTrue(
+            append_observation(
+                marked,
+                {**base, "viewer_count": 100, "viewer_approximate": True, "like_count": 1},
+                start + 80,
+            )
+        )
+        rough = day_view(marked, local_day(start))["rooms"][0]
+        self.assertTrue(rough["viewer_segments"][0]["approximate"])
+        self.assertIsNone(rough["peak_viewers"])
 
     def test_sort_live_rooms_by_viewers(self):
         ordered = sort_rooms(

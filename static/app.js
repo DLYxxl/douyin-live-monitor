@@ -256,34 +256,114 @@ function renderRoster(rooms) {
   });
 }
 
+function chartTime(timestamp, withSeconds) {
+  const options = { hour: "2-digit", minute: "2-digit", hour12: false };
+  if (withSeconds) options.second = "2-digit";
+  return new Intl.DateTimeFormat("zh-CN", options).format(new Date(timestamp * 1000));
+}
+
+function countLabel(point) {
+  return formatNumber(point.count) + (point.approximate ? "+" : "");
+}
+
+function svgEl(name, attrs) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+  Object.entries(attrs).forEach(([key, value]) => node.setAttribute(key, value));
+  return node;
+}
+
 function detailChart(history) {
-  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 640 220");
-  svg.setAttribute("class", "trend");
-  svg.setAttribute("role", "img");
-  const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
-  axis.setAttribute("class", "axis");
-  axis.setAttribute("x1", "16");
-  axis.setAttribute("x2", "624");
-  axis.setAttribute("y1", "188");
-  axis.setAttribute("y2", "188");
-  svg.append(axis);
-  if (!history || history.length < 2) {
+  const svg = svgEl("svg", { viewBox: "0 0 640 300", class: "trend", role: "img" });
+  const usable = (history || []).filter((point) => typeof point.count === "number" && typeof point.t === "number");
+  const axisY = 214;
+  svg.append(svgEl("line", { class: "axis", x1: "36", x2: "604", y1: String(axisY), y2: String(axisY) }));
+  if (usable.length < 2) {
     svg.setAttribute("aria-label", "采样点还不够，暂时画不出走势");
     return svg;
   }
-  const counts = history.map((point) => point.count);
+  const left = 36;
+  const right = 604;
+  const top = 28;
+  const bottom = 198;
+  const start = usable[0].t;
+  const end = usable[usable.length - 1].t;
+  const timeSpan = Math.max(end - start, 1);
+  const counts = usable.map((point) => point.count);
   const min = Math.min(...counts);
   const max = Math.max(...counts);
-  const span = Math.max(1, max - min);
-  const points = history.map((point, index) => {
-    const x = 16 + (index / (history.length - 1)) * 608;
-    const y = 176 - ((point.count - min) / span) * 150;
-    return x.toFixed(1) + "," + y.toFixed(1);
+  const countSpan = Math.max(1, max - min);
+  const coords = usable.map((point) => ({
+    t: point.t,
+    count: point.count,
+    approximate: Boolean(point.approximate),
+    x: left + ((point.t - start) / timeSpan) * (right - left),
+    y: bottom - ((point.count - min) / countSpan) * (bottom - top),
+  }));
+  svg.append(svgEl("polyline", { points: coords.map((point) => point.x.toFixed(1) + "," + point.y.toFixed(1)).join(" ") }));
+  const spacing = (right - left) / Math.max(1, coords.length - 1);
+  const labeled = new Set();
+  if (spacing >= 52) {
+    coords.forEach((_, index) => labeled.add(index));
+  } else {
+    labeled.add(0);
+    labeled.add(coords.length - 1);
+    let peak = coords.findIndex((point) => !point.approximate);
+    if (peak < 0) peak = 0;
+    coords.forEach((point, index) => {
+      const betterExact = !point.approximate && (coords[peak].approximate || point.count >= coords[peak].count);
+      const betterApprox = point.approximate && coords[peak].approximate && point.count >= coords[peak].count;
+      if (betterExact || betterApprox) peak = index;
+    });
+    labeled.add(peak);
+    const step = Math.max(1, Math.ceil(coords.length / 6));
+    for (let index = 0; index < coords.length; index += step) labeled.add(index);
+    const ordered = [...labeled].sort((a, b) => coords[a].x - coords[b].x);
+    let lastX = -999;
+    ordered.forEach((index) => {
+      const must = index === 0 || index === coords.length - 1 || index === peak;
+      if (!must && coords[index].x - lastX < 52) {
+        labeled.delete(index);
+        return;
+      }
+      lastX = coords[index].x;
+    });
+  }
+  coords.forEach((point, index) => {
+    const dot = svgEl("circle", { cx: point.x.toFixed(1), cy: point.y.toFixed(1), r: "3.5", class: "node" });
+    const tip = document.createElementNS("http://www.w3.org/2000/svg", "title");
+    tip.textContent = chartTime(point.t, true) + "  " + countLabel(point) + (point.approximate ? "（约数，不是精确整数）" : " 人");
+    dot.append(tip);
+    svg.append(dot);
+    if (!labeled.has(index)) return;
+    const anchor = index === 0 ? "start" : index === coords.length - 1 ? "end" : "middle";
+    const label = svgEl("text", {
+      x: point.x.toFixed(1),
+      y: Math.max(14, point.y - 10).toFixed(1),
+      "text-anchor": anchor,
+      class: "count-label",
+    });
+    label.textContent = countLabel(point);
+    svg.append(label);
   });
-  const poly = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
-  poly.setAttribute("points", points.join(" "));
-  svg.append(poly);
+  const withSeconds = timeSpan < 600;
+  const tickCount = timeSpan >= 240 ? 5 : 4;
+  let previousTick = -999;
+  for (let index = 0; index < tickCount; index += 1) {
+    const tick = start + (timeSpan * index) / (tickCount - 1);
+    const x = left + ((tick - start) / timeSpan) * (right - left);
+    const edge = index === 0 || index === tickCount - 1;
+    if (!edge && x - previousTick < 78) continue;
+    previousTick = x;
+    svg.append(svgEl("line", { class: "tick", x1: x.toFixed(1), x2: x.toFixed(1), y1: String(axisY), y2: String(axisY + 6) }));
+    const timeLabel = svgEl("text", {
+      x: x.toFixed(1),
+      y: "246",
+      "text-anchor": index === 0 ? "start" : index === tickCount - 1 ? "end" : "middle",
+      class: "time-label",
+    });
+    timeLabel.textContent = chartTime(tick, withSeconds);
+    svg.append(timeLabel);
+  }
   svg.setAttribute("aria-label", "本机采样的在线人数，从 " + formatNumber(min) + " 到 " + formatNumber(max));
   return svg;
 }

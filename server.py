@@ -152,8 +152,12 @@ def room_detail(item: dict, history: list[dict]) -> dict:
     live_seconds = None
     if item.get("live") and isinstance(started, int) and 1_000_000_000 <= started <= now + 120:
         live_seconds = max(0, int(now - started))
-    counts = [point["count"] for point in history if isinstance(point.get("count"), int)]
-    if isinstance(item.get("viewer_count"), int):
+    counts = [
+        point["count"]
+        for point in history
+        if isinstance(point.get("count"), int) and not point.get("approximate")
+    ]
+    if isinstance(item.get("viewer_count"), int) and not item.get("viewer_approximate"):
         counts.append(item["viewer_count"])
     stored_peak = item.get("observed_peak")
     peak = stored_peak if isinstance(stored_peak, int) else None
@@ -241,6 +245,7 @@ def append_observation(store: dict[str, dict], item: dict, when: float) -> bool:
         "watched": watched,
         "live": bool(item.get("live")),
         "started_at": _kept_int(item.get("started_at")),
+        "viewers_approximate": bool(viewers is not None and item.get("viewer_approximate")),
     }
     day = local_day(when)
     rooms_on_day = store.setdefault(day, {})
@@ -261,7 +266,10 @@ def append_observation(store: dict[str, dict], item: dict, when: float) -> bool:
     samples: list[dict] = room["samples"]
     if samples:
         previous = samples[-1]
-        unchanged = all(previous.get(key) == sample[key] for key in ("viewers", "likes", "follows", "watched", "live"))
+        unchanged = all(
+            previous.get(key) == sample[key]
+            for key in ("viewers", "likes", "follows", "watched", "live", "viewers_approximate")
+        )
         if unchanged and when - float(previous.get("t") or 0) < 15:
             return False
     samples.append(sample)
@@ -280,12 +288,16 @@ def _last_int(samples: list[dict], key: str) -> int | None:
 
 def summarize_day_room(room: dict) -> dict:
     samples = [sample for sample in room.get("samples") or [] if isinstance(sample, dict)]
-    viewer_points = [
-        {"t": sample["t"], "count": sample["viewers"]}
-        for sample in samples
-        if isinstance(sample.get("t"), (int, float)) and isinstance(sample.get("viewers"), int)
-    ]
-    peak = max((point["count"] for point in viewer_points), default=None)
+    viewer_points = []
+    for sample in samples:
+        if not isinstance(sample.get("t"), (int, float)) or not isinstance(sample.get("viewers"), int):
+            continue
+        point = {"t": sample["t"], "count": sample["viewers"]}
+        if sample.get("viewers_approximate"):
+            point["approximate"] = True
+        viewer_points.append(point)
+    exact_counts = [point["count"] for point in viewer_points if not point.get("approximate")]
+    peak = max(exact_counts, default=None)
     recorded = None
     if len(samples) >= 2 and isinstance(samples[0].get("t"), (int, float)) and isinstance(samples[-1].get("t"), (int, float)):
         recorded = max(0, int(samples[-1]["t"] - samples[0]["t"]))
@@ -303,6 +315,7 @@ def summarize_day_room(room: dict) -> dict:
                 "follows": _kept_int(sample.get("follows")),
                 "watched": _kept_int(sample.get("watched")),
                 "live": bool(sample.get("live")),
+                "viewers_approximate": bool(sample.get("viewers_approximate")),
             }
             for sample in samples
             if isinstance(sample.get("t"), (int, float))
@@ -400,11 +413,16 @@ def hydrate_today() -> None:
         saved = by_room.get(str(item.get("room_id") or ""))
         if not saved:
             continue
-        points = [
-            {"t": sample["t"], "count": sample["viewers"]}
-            for sample in saved.get("samples") or []
-            if isinstance(sample, dict) and isinstance(sample.get("t"), (int, float)) and isinstance(sample.get("viewers"), int)
-        ]
+        points = []
+        for sample in saved.get("samples") or []:
+            if not isinstance(sample, dict) or not isinstance(sample.get("t"), (int, float)):
+                continue
+            if not isinstance(sample.get("viewers"), int):
+                continue
+            point = {"t": sample["t"], "count": sample["viewers"]}
+            if sample.get("viewers_approximate"):
+                point["approximate"] = True
+            points.append(point)
         if points:
             histories[item["id"]] = points[-HISTORY_LIMIT:]
 
@@ -452,7 +470,7 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     for field in ("started_at", "session_follows", "like_count", "session_viewers"):
         if snap.get(field) is not None:
             item[field] = snap[field]
-    if isinstance(item.get("viewer_count"), int):
+    if isinstance(item.get("viewer_count"), int) and not item.get("viewer_approximate"):
         previous_peak = item.get("observed_peak")
         if not isinstance(previous_peak, int) or item["viewer_count"] > previous_peak:
             item["observed_peak"] = item["viewer_count"]
@@ -461,7 +479,10 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     item["updated_at"] = time.time()
     if item["live"] and isinstance(item["viewer_count"], int):
         series = histories.setdefault(item["id"], [])
-        series.append({"t": item["updated_at"], "count": item["viewer_count"]})
+        point = {"t": item["updated_at"], "count": item["viewer_count"]}
+        if item.get("viewer_approximate"):
+            point["approximate"] = True
+        series.append(point)
         del series[:-HISTORY_LIMIT]
     remember_observation(item, item["updated_at"])
 
@@ -508,7 +529,9 @@ def add_room(query: str) -> dict:
         "session_follows": snap.get("session_follows"),
         "like_count": snap.get("like_count"),
         "session_viewers": snap.get("session_viewers"),
-        "observed_peak": snap.get("viewer_count") if isinstance(snap.get("viewer_count"), int) else None,
+        "observed_peak": snap.get("viewer_count")
+        if isinstance(snap.get("viewer_count"), int) and not snap.get("viewer_approximate")
+        else None,
         "error": None,
         "updated_at": now,
         "added_at": now,
@@ -519,7 +542,10 @@ def add_room(query: str) -> dict:
             raise DouyinLookupError("这个直播间已经在列表里")
         rooms.append(item)
         if item["live"] and isinstance(item["viewer_count"], int):
-            histories[item["id"]] = [{"t": now, "count": item["viewer_count"]}]
+            point = {"t": now, "count": item["viewer_count"]}
+            if item.get("viewer_approximate"):
+                point["approximate"] = True
+            histories[item["id"]] = [point]
         save_rooms()
         created = public_room(item)
     remember_observation(item, now)
