@@ -200,6 +200,31 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(metrics["session_follows"], 106)
         self.assertEqual(metrics["like_count"], 3251)
         self.assertIsNone(metrics["gift_count"])
+        self.assertIsNone(metrics["session_viewers"])
+        watched = session_metrics(
+            {
+                "room_view_stats": {
+                    "display_type": 3,
+                    "display_value": 234998,
+                    "display_long": "23.5万人看过",
+                    "is_hidden": False,
+                },
+                "stats": {"total_user": 210400},
+            }
+        )
+        self.assertEqual(watched["session_viewers"], 234998)
+        online_only = session_metrics(
+            {
+                "room_view_stats": {
+                    "display_type": 1,
+                    "display_value": 105,
+                    "display_long": "105在线观众",
+                    "is_hidden": False,
+                },
+                "stats": {"total_user": 9999},
+            }
+        )
+        self.assertIsNone(online_only["session_viewers"])
 
     def test_detail_does_not_invent_today_followers_or_gift_segments(self):
         detail = room_detail(
@@ -214,6 +239,10 @@ class ParseTests(unittest.TestCase):
         )
         self.assertIsNone(detail["today_followers"])
         self.assertIsNone(detail["gift_segments"])
+        self.assertIsNone(detail["average_online"])
+        self.assertIsNone(detail["average_stay_seconds"])
+        self.assertIn("平均在线", detail["average_online_reason"])
+        self.assertIn("停留", detail["average_stay_reason"])
         self.assertIn("自然日", detail["today_followers_reason"])
         self.assertIn("礼物", detail["gift_reason"])
         self.assertEqual(detail["session_follows"], 4)

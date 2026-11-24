@@ -330,6 +330,18 @@ GIFT_SEGMENTS_UNAVAILABLE = (
     "公开房间接口没有按时间段统计的礼物。"
     "未登录时 gift_uv_count 和 fan_ticket 在正在直播、而且很热闹的房间里也一直是 0，不能把 0 显示成礼物数。"
 )
+AVERAGE_ONLINE_UNAVAILABLE = (
+    "公开房间接口没有这一场的平均在线人数。"
+    "本机只有每隔一会儿的采样，不能把这些点的平均数说成整场平均在线。"
+)
+AVERAGE_STAY_UNAVAILABLE = (
+    "公开房间接口没有人均停留时间。"
+    "用在线人数、场观和直播时长反推会是估算，这里不算。"
+)
+SESSION_VIEWERS_NOTE = (
+    "来自公开房间展示里的「人看过」整数（room_view_stats.display_value，且文案是人看过）。"
+    "stats.total_user 经常是另一个数，没有拿来顶替。这不是后台单独给出的去重名单。"
+)
 VIEWER_SEGMENTS_NOTE = (
     "这些点是本机每次刷新记下的在线人数，按时间排开。"
     "抖音这条公开接口不提供整场的人数分段，程序没开着的时段这里是空的。"
@@ -351,7 +363,7 @@ def session_metrics(room: dict) -> dict:
     点赞用房间上的 like_count；stats.like_count 在这条接口里恒为 0。
     """
     if not isinstance(room, dict):
-        return {"started_at": None, "session_follows": None, "like_count": None}
+        return {"started_at": None, "session_follows": None, "like_count": None, "session_viewers": None}
     stats = room.get("stats") if isinstance(room.get("stats"), dict) else {}
     started = _plain_int(room.get("start_time")) or _plain_int(room.get("create_time"))
     if started is not None and started < 1_000_000_000:
@@ -366,7 +378,27 @@ def session_metrics(room: dict) -> dict:
         "session_follows": _plain_int(stats.get("follow_count")),
         "like_count": _plain_int(room.get("like_count")),
         "gift_count": gift_count,
+        "session_viewers": _session_viewers(room),
     }
+
+
+def _session_viewers(room: dict) -> int | None:
+    """只要公开文案写明「人看过」的那个整数。在线观众和 total_user 都不是这个数。"""
+    view = room.get("room_view_stats") if isinstance(room.get("room_view_stats"), dict) else {}
+    if not view or view.get("is_hidden"):
+        return None
+    if view.get("display_type") != 3:
+        return None
+    if "看过" not in str(view.get("display_long") or ""):
+        return None
+    value = view.get("display_value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    if int(value) < 0:
+        return None
+    return int(value)
 
 
 def _fold_name(text: str) -> str:
@@ -566,7 +598,7 @@ class DouyinClient:
                 for field in ("nickname", "display_id", "avatar", "title"):
                     if rich.get(field):
                         snap[field] = rich[field]
-                for field in ("started_at", "session_follows", "like_count", "gift_count"):
+                for field in ("started_at", "session_follows", "like_count", "gift_count", "session_viewers"):
                     if rich.get(field) is not None:
                         snap[field] = rich[field]
                 snap["live"] = rich["live"]

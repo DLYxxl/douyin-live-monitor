@@ -398,6 +398,13 @@ function renderDetail(rooms) {
   } else {
     grid.append(metricTile("峰值在线人数", "还没有整数采样", "要有一次成功刷新到的整数在线人数后才会显示。不把接口里的 0 当成峰值。", true));
   }
+  if (typeof detail.session_viewers === "number") {
+    grid.append(metricTile("场观人数", formatNumber(detail.session_viewers), detail.session_viewers_note || "来自公开的「人看过」整数。", false));
+  } else {
+    grid.append(metricTile("场观人数", "这次没有「人看过」", "只有文案写明人看过、而且给出整数时才显示。不用另一个对不上的 total_user 来填。", true));
+  }
+  grid.append(metricTile("平均在线人数", "公开数据里没有这项", detail.average_online_reason || "没有整场平均在线。", true));
+  grid.append(metricTile("人均停留时间", "公开数据里没有这项", detail.average_stay_reason || "没有人均停留。", true));
 
   const viewersBlock = document.createElement("section");
   viewersBlock.className = "segment-block";

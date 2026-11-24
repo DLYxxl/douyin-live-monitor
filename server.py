@@ -16,7 +16,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from douyin import (
+    AVERAGE_ONLINE_UNAVAILABLE,
+    AVERAGE_STAY_UNAVAILABLE,
     GIFT_SEGMENTS_UNAVAILABLE,
+    SESSION_VIEWERS_NOTE,
     TODAY_FOLLOWERS_UNAVAILABLE,
     VIEWER_SEGMENTS_NOTE,
     DouyinClient,
@@ -152,6 +155,7 @@ def room_detail(item: dict, history: list[dict]) -> dict:
         peak = max(counts) if peak is None else max(peak, max(counts))
     follows = item.get("session_follows")
     likes = item.get("like_count")
+    viewers = item.get("session_viewers")
     return {
         "started_at": started if isinstance(started, int) else None,
         "live_seconds": live_seconds,
@@ -159,6 +163,12 @@ def room_detail(item: dict, history: list[dict]) -> dict:
         "today_followers": None,
         "today_followers_reason": TODAY_FOLLOWERS_UNAVAILABLE,
         "like_count": likes if isinstance(likes, int) else None,
+        "session_viewers": viewers if isinstance(viewers, int) else None,
+        "session_viewers_note": SESSION_VIEWERS_NOTE,
+        "average_online": None,
+        "average_online_reason": AVERAGE_ONLINE_UNAVAILABLE,
+        "average_stay_seconds": None,
+        "average_stay_reason": AVERAGE_STAY_UNAVAILABLE,
         "gift_segments": None,
         "gift_reason": GIFT_SEGMENTS_UNAVAILABLE,
         "viewer_segments": history,
@@ -190,7 +200,7 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     new_room = str(snap.get("room_id") or "")
     if previous_room and new_room and previous_room != new_room:
         histories[item["id"]] = []
-        for field in ("started_at", "session_follows", "like_count", "observed_peak"):
+        for field in ("started_at", "session_follows", "like_count", "session_viewers", "observed_peak"):
             item.pop(field, None)
     for field in ("room_id", "display_id", "nickname", "avatar", "title", "web_path"):
         value = snap.get(field)
@@ -207,7 +217,7 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     item["viewer_count"] = snap.get("viewer_count")
     item["viewer_approximate"] = bool(snap.get("viewer_approximate"))
     item["total_user"] = snap.get("total_user")
-    for field in ("started_at", "session_follows", "like_count"):
+    for field in ("started_at", "session_follows", "like_count", "session_viewers"):
         if snap.get(field) is not None:
             item[field] = snap[field]
     if isinstance(item.get("viewer_count"), int):
@@ -264,6 +274,7 @@ def add_room(query: str) -> dict:
         "started_at": snap.get("started_at"),
         "session_follows": snap.get("session_follows"),
         "like_count": snap.get("like_count"),
+        "session_viewers": snap.get("session_viewers"),
         "observed_peak": snap.get("viewer_count") if isinstance(snap.get("viewer_count"), int) else None,
         "error": None,
         "updated_at": now,
