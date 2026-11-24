@@ -418,6 +418,50 @@ a:focus-visible {
 
 .back-list { display: none; }
 
+.calendar {
+  margin-top: 22px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: rgba(18, 21, 26, 0.92);
+  padding: 16px;
+}
+
+.calendar header, .calendar-nav { display: flex; justify-content: space-between; gap: 12px; align-items: center; }
+
+.calendar h2 { margin: 0; font-size: 18px; }
+
+.calendar-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.calendar-grid span, .calendar-grid button {
+  min-height: 42px;
+  border-radius: 12px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.calendar-grid .weekday { text-align: center; color: var(--faint); min-height: 0; }
+
+.calendar-grid button { border-color: var(--line); }
+
+.calendar-grid button.has-data { color: var(--text); box-shadow: inset 0 -2px 0 var(--teal); }
+
+.calendar-grid button.is-selected { border-color: rgba(126, 224, 203, 0.6); background: rgba(126, 224, 203, 0.08); }
+
+.calendar-grid button.is-today { color: var(--text); }
+
+.day-panel { margin-top: 16px; }
+
+.day-room { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+
+.day-room h3 { margin: 0 0 8px; font-size: 16px; }
+
 .list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));

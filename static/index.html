@@ -19,6 +19,7 @@
       </div>
       <div class="top-actions">
         <p class="refresh-note" id="refresh-note">大约每 10 秒自动刷新</p>
+        <button type="button" class="ghost" id="calendar-button">日历</button>
         <button type="button" class="ghost" id="refresh-button">立即刷新</button>
       </div>
     </header>
@@ -43,8 +44,10 @@
       <section id="detail" class="detail" hidden></section>
     </div>
 
+    <section id="calendar" class="calendar" hidden></section>
+
     <footer class="foot">
-      <p>人数来自抖音公开直播间页面和公开 webcast 接口，不是官方开放平台。按昵称查找只覆盖刚拉到的一小批公开热门直播，会漏人，也不会编造匹配或人数。抖音改版、限流后可能暂时失败。名单只保存在本机的 data/watchlist.json，不需要登录。</p>
+      <p>人数来自抖音公开直播间页面和公开 webcast 接口，不是官方开放平台。按昵称查找只覆盖刚拉到的一小批公开热门直播，会漏人，也不会编造匹配或人数。日历只保存本机刷新到的读数，在 data/history.json。抖音改版、限流后可能暂时失败。名单只保存在本机的 data/watchlist.json，不需要登录。</p>
     </footer>
   </div>
   <noscript>

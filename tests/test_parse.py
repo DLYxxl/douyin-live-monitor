@@ -14,7 +14,7 @@ from douyin import (
     query_action,
     session_metrics,
 )
-from server import room_detail
+from server import MAX_DAY_SAMPLES, append_observation, day_view, local_day, room_detail, _thin_samples
 from server import sort_rooms
 
 
@@ -252,6 +252,47 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(kept["observed_peak"], 80)
         offline = room_detail({"live": False, "started_at": int(time.time()) - 500}, [])
         self.assertIsNone(offline["live_seconds"])
+
+    def test_daily_history_keeps_recorded_numbers_only(self):
+        store = {}
+        start = time.time()
+        base = {"room_id": "1", "nickname": "甲", "display_id": "dy", "live": True, "started_at": int(start)}
+        self.assertTrue(
+            append_observation(
+                store,
+                {**base, "viewer_count": 3, "like_count": 1, "session_follows": 0, "session_viewers": 10},
+                start,
+            )
+        )
+        self.assertTrue(
+            append_observation(
+                store,
+                {**base, "viewer_count": 9, "like_count": 4, "session_follows": 1, "session_viewers": 12},
+                start + 20,
+            )
+        )
+        self.assertFalse(
+            append_observation(
+                store,
+                {**base, "viewer_count": 9, "like_count": 4, "session_follows": 1, "session_viewers": 12},
+                start + 25,
+            )
+        )
+        view = day_view(store, local_day(start))
+        room = view["rooms"][0]
+        self.assertEqual(room["peak_viewers"], 9)
+        self.assertEqual(room["likes"], 4)
+        self.assertEqual(room["follows"], 1)
+        self.assertEqual(room["watched"], 12)
+        self.assertIsNone(room["gifts"])
+        self.assertIsNone(room["average_online"])
+        self.assertIsNone(room["average_stay_seconds"])
+        self.assertIsNone(room["today_followers"])
+        self.assertTrue(day_view(store, "2000-01-01")["empty"])
+        crowded = [{"t": index, "viewers": 50 if index == 10 else 1, "likes": index} for index in range(MAX_DAY_SAMPLES + 1)]
+        thinned = _thin_samples(crowded)
+        self.assertLess(len(thinned), len(crowded))
+        self.assertEqual(max(sample["viewers"] for sample in thinned), 50)
 
     def test_sort_live_rooms_by_viewers(self):
         ordered = sort_rooms(

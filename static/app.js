@@ -2,6 +2,8 @@ const queryInput = document.getElementById("query");
 const addForm = document.getElementById("add-form");
 const addButton = document.getElementById("add-button");
 const suggestButton = document.getElementById("suggest-button");
+const calendarButton = document.getElementById("calendar-button");
+const calendarEl = document.getElementById("calendar");
 const refreshButton = document.getElementById("refresh-button");
 const formError = document.getElementById("form-error");
 const nameSearchEl = document.getElementById("name-search");
@@ -27,6 +29,12 @@ let nameSearchRooms = [];
 let nameSearchQuery = "";
 let selectedId = "";
 let pinSelection = false;
+let calendarOpen = false;
+let calendarCursor = new Date();
+let calendarMonth = null;
+let calendarDay = "";
+let calendarDayView = null;
+let calendarLoading = false;
 let polling = false;
 let renderKey = "";
 
@@ -785,6 +793,204 @@ async function loadNameSearch(query) {
   }
 }
 
+function monthKey(date) {
+  return date.getFullYear() + "-" + String(date.getMonth() + 1).padStart(2, "0");
+}
+
+function dayKey(date) {
+  return monthKey(date) + "-" + String(date.getDate()).padStart(2, "0");
+}
+
+function renderCalendar() {
+  if (!calendarOpen) {
+    calendarEl.hidden = true;
+    return;
+  }
+  calendarEl.hidden = false;
+  calendarEl.replaceChildren();
+  const header = document.createElement("header");
+  const title = document.createElement("h2");
+  title.textContent = "每日记录";
+  const close = document.createElement("button");
+  close.type = "button";
+  close.className = "ghost";
+  close.textContent = "收起";
+  close.addEventListener("click", () => {
+    calendarOpen = false;
+    renderCalendar();
+  });
+  header.append(title, close);
+  const nav = document.createElement("div");
+  nav.className = "calendar-nav";
+  const previous = document.createElement("button");
+  previous.type = "button";
+  previous.className = "ghost";
+  previous.textContent = "上个月";
+  previous.addEventListener("click", () => shiftMonth(-1));
+  const label = document.createElement("strong");
+  label.textContent = calendarCursor.getFullYear() + "年" + (calendarCursor.getMonth() + 1) + "月";
+  const next = document.createElement("button");
+  next.type = "button";
+  next.className = "ghost";
+  next.textContent = "下个月";
+  next.addEventListener("click", () => shiftMonth(1));
+  nav.append(previous, label, next);
+  const note = document.createElement("p");
+  note.className = "suggest-note";
+  note.textContent = calendarLoading
+    ? "正在读取本机日历…"
+    : (calendarMonth && calendarMonth.note) || "按这台电脑的本地日期查看。没有刷新过的日子是空的。";
+  calendarEl.append(header, nav, note, buildMonthGrid(), buildDayPanel());
+}
+
+function buildMonthGrid() {
+  const grid = document.createElement("div");
+  grid.className = "calendar-grid";
+  ["一", "二", "三", "四", "五", "六", "日"].forEach((name) => {
+    const cell = document.createElement("span");
+    cell.className = "weekday";
+    cell.textContent = name;
+    grid.append(cell);
+  });
+  const year = calendarCursor.getFullYear();
+  const month = calendarCursor.getMonth();
+  const first = new Date(year, month, 1);
+  const start = new Date(first);
+  start.setDate(1 - ((first.getDay() + 6) % 7));
+  const today = dayKey(new Date());
+  const marked = (calendarMonth && calendarMonth.days) || {};
+  for (let index = 0; index < 42; index += 1) {
+    const cell = new Date(start);
+    cell.setDate(start.getDate() + index);
+    const key = dayKey(cell);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = String(cell.getDate());
+    if (cell.getMonth() !== month) button.disabled = true;
+    if (marked[key]) button.classList.add("has-data");
+    if (key === today) button.classList.add("is-today");
+    if (key === calendarDay) button.classList.add("is-selected");
+    button.addEventListener("click", () => selectDay(key));
+    grid.append(button);
+  }
+  return grid;
+}
+
+function buildDayPanel() {
+  const panel = document.createElement("div");
+  panel.className = "day-panel";
+  if (!calendarDay) {
+    const empty = document.createElement("p");
+    empty.className = "suggest-note";
+    empty.textContent = "点一天查看记录。";
+    panel.append(empty);
+    return panel;
+  }
+  const heading = document.createElement("h3");
+  heading.textContent = calendarDay;
+  panel.append(heading);
+  if (!calendarDayView) {
+    const waiting = document.createElement("p");
+    waiting.className = "suggest-note";
+    waiting.textContent = "正在读取这一天…";
+    panel.append(waiting);
+    return panel;
+  }
+  if (calendarDayView.empty || !(calendarDayView.rooms || []).length) {
+    const empty = document.createElement("p");
+    empty.className = "suggest-note";
+    empty.textContent = "这一天没有记录。程序只在打开并刷新到直播间时写入，关掉之后的时段不会补上。";
+    panel.append(empty);
+    return panel;
+  }
+  const intro = document.createElement("p");
+  intro.className = "suggest-note";
+  intro.textContent = calendarDayView.note || "";
+  panel.append(intro);
+  calendarDayView.rooms.forEach((room) => panel.append(renderDayRoom(room)));
+  return panel;
+}
+
+function renderDayRoom(room) {
+  const block = document.createElement("article");
+  block.className = "day-room";
+  const title = document.createElement("h3");
+  title.textContent = room.nickname || room.display_id || room.room_id || "未命名直播间";
+  const meta = document.createElement("p");
+  meta.className = "meta";
+  meta.textContent = room.display_id ? "抖音号 " + room.display_id : "";
+  const grid = document.createElement("div");
+  grid.className = "metric-grid";
+  if (typeof room.peak_viewers === "number") {
+    grid.append(metricTile("峰值在线人数", formatNumber(room.peak_viewers), "这一天采样到的最高整数在线人数，不是抖音公布的整场峰值。", false));
+  } else {
+    grid.append(metricTile("峰值在线人数", "没有整数在线人数", "这一天的记录里没有 viewer 整数。", true));
+  }
+  if (typeof room.likes === "number") {
+    grid.append(metricTile("点赞数量", formatNumber(room.likes), "这一天最后一次读到的房间累计点赞，不是当天新增加的赞。", false));
+  } else {
+    grid.append(metricTile("点赞数量", "没有读到", "这一天没有 like_count。", true));
+  }
+  if (typeof room.watched === "number") {
+    grid.append(metricTile("场观人数", formatNumber(room.watched), "这一天最后一次读到的「人看过」。", false));
+  } else {
+    grid.append(metricTile("场观人数", "没有读到", "这一天没有「人看过」整数。", true));
+  }
+  if (typeof room.follows === "number") {
+    grid.append(metricTile("本场新增关注", formatNumber(room.follows), "这一天最后一次读到的本场新增关注，不是自然日新增粉丝。", false));
+  } else {
+    grid.append(metricTile("本场新增关注", "没有读到", "这一天没有 follow_count。", true));
+  }
+  grid.append(metricTile("今日新增粉丝", "没有这项", room.today_followers_reason || "", true));
+  if (typeof room.recorded_seconds === "number") {
+    grid.append(metricTile("记录时长", formatDuration(room.recorded_seconds), "从这一天第一条记录到最后一条，不是整场直播时长。", false));
+  } else {
+    grid.append(metricTile("记录时长", "只有一个点", "至少两次记录才能算出这段时间。", true));
+  }
+  grid.append(metricTile("平均在线人数", "没有这项", room.average_online_reason || "", true));
+  grid.append(metricTile("人均停留时间", "没有这项", room.average_stay_reason || "", true));
+  grid.append(metricTile("礼物", "没有这项", room.gift_reason || "", true));
+  const chartTitle = document.createElement("h3");
+  chartTitle.textContent = "这一天的在线人数";
+  const chart = detailChart(room.viewer_segments || []);
+  block.append(title, meta, grid, chartTitle, chart);
+  return block;
+}
+
+async function shiftMonth(offset) {
+  calendarCursor = new Date(calendarCursor.getFullYear(), calendarCursor.getMonth() + offset, 1);
+  calendarDay = "";
+  calendarDayView = null;
+  await loadCalendarMonth();
+}
+
+async function selectDay(day) {
+  calendarDay = day;
+  calendarDayView = null;
+  renderCalendar();
+  try {
+    calendarDayView = await api("/api/history?day=" + encodeURIComponent(day));
+  } catch (error) {
+    calendarDayView = { empty: true, note: error.message, rooms: [] };
+  }
+  renderCalendar();
+}
+
+async function loadCalendarMonth() {
+  calendarOpen = true;
+  calendarLoading = true;
+  renderCalendar();
+  calendarEl.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  try {
+    calendarMonth = await api("/api/history?month=" + monthKey(calendarCursor));
+  } catch (error) {
+    calendarMonth = { days: {}, note: error.message };
+  } finally {
+    calendarLoading = false;
+    renderCalendar();
+  }
+}
+
 addForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const query = queryInput.value.trim();
@@ -801,6 +1007,16 @@ addForm.addEventListener("submit", (event) => {
 });
 
 queryInput.addEventListener("input", refreshAddLabel);
+
+calendarButton.addEventListener("click", () => {
+  if (calendarOpen) {
+    calendarOpen = false;
+    renderCalendar();
+    return;
+  }
+  if (!calendarDay) calendarDay = dayKey(new Date());
+  loadCalendarMonth().then(() => selectDay(calendarDay));
+});
 
 suggestButton.addEventListener("click", () => {
   if (suggestionsOpen && !suggestionsLoading) {

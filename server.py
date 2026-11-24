@@ -12,6 +12,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -34,13 +35,18 @@ from douyin import (
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DATA_PATH = ROOT / "data" / "watchlist.json"
+HISTORY_PATH = ROOT / "data" / "history.json"
 MAX_ROOMS = 20
 DEFAULT_INTERVAL = 10
 HISTORY_LIMIT = 180
+MAX_DAY_SAMPLES = 1500
+RETAIN_DAYS = 120
 
 rooms: list[dict] = []
 histories: dict[str, list[dict]] = {}
+daily_history: dict[str, dict[str, dict]] = {}
 data_lock = threading.Lock()
+history_lock = threading.Lock()
 net_lock = threading.Lock()
 refresh_lock = threading.Lock()
 client = DouyinClient()
@@ -177,6 +183,232 @@ def room_detail(item: dict, history: list[dict]) -> dict:
     }
 
 
+def local_day(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
+def _kept_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _thin_samples(samples: list[dict]) -> list[dict]:
+    """相邻两点合成一点时留下较高的在线人数，避免抽稀把峰值丢掉。"""
+    if len(samples) <= MAX_DAY_SAMPLES:
+        return samples
+    thinned: list[dict] = []
+    index = 0
+    while index < len(samples):
+        if index + 1 < len(samples):
+            first, second = samples[index], samples[index + 1]
+            counts = [value for value in (_kept_int(first.get("viewers")), _kept_int(second.get("viewers"))) if value is not None]
+            merged = dict(second)
+            if counts:
+                merged["viewers"] = max(counts)
+            thinned.append(merged)
+            index += 2
+        else:
+            thinned.append(samples[index])
+            index += 1
+    return thinned
+
+
+def prune_history(store: dict[str, dict], today: date | None = None) -> None:
+    anchor = today or datetime.now().astimezone().date()
+    cutoff = (anchor - timedelta(days=RETAIN_DAYS)).isoformat()
+    for day in list(store):
+        if day < cutoff:
+            del store[day]
+
+
+def append_observation(store: dict[str, dict], item: dict, when: float) -> bool:
+    """把一次真实读数归到本地日期。没有整数读数时不写。"""
+    viewers = _kept_int(item.get("viewer_count"))
+    likes = _kept_int(item.get("like_count"))
+    follows = _kept_int(item.get("session_follows"))
+    watched = _kept_int(item.get("session_viewers"))
+    if viewers is None and likes is None and follows is None and watched is None:
+        return False
+    room_key = str(item.get("room_id") or item.get("display_id") or item.get("nickname") or "")
+    if not room_key:
+        return False
+    sample = {
+        "t": when,
+        "viewers": viewers,
+        "likes": likes,
+        "follows": follows,
+        "watched": watched,
+        "live": bool(item.get("live")),
+        "started_at": _kept_int(item.get("started_at")),
+    }
+    day = local_day(when)
+    rooms_on_day = store.setdefault(day, {})
+    room = rooms_on_day.get(room_key)
+    if room is None:
+        room = {
+            "room_id": str(item.get("room_id") or ""),
+            "display_id": str(item.get("display_id") or ""),
+            "nickname": str(item.get("nickname") or ""),
+            "web_path": str(item.get("web_path") or ""),
+            "samples": [],
+        }
+        rooms_on_day[room_key] = room
+    for field in ("room_id", "display_id", "nickname", "web_path"):
+        value = item.get(field)
+        if value:
+            room[field] = str(value)
+    samples: list[dict] = room["samples"]
+    if samples:
+        previous = samples[-1]
+        unchanged = all(previous.get(key) == sample[key] for key in ("viewers", "likes", "follows", "watched", "live"))
+        if unchanged and when - float(previous.get("t") or 0) < 15:
+            return False
+    samples.append(sample)
+    room["samples"] = _thin_samples(samples)
+    prune_history(store, datetime.fromtimestamp(when).astimezone().date())
+    return True
+
+
+def _last_int(samples: list[dict], key: str) -> int | None:
+    for sample in reversed(samples):
+        value = _kept_int(sample.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def summarize_day_room(room: dict) -> dict:
+    samples = [sample for sample in room.get("samples") or [] if isinstance(sample, dict)]
+    viewer_points = [
+        {"t": sample["t"], "count": sample["viewers"]}
+        for sample in samples
+        if isinstance(sample.get("t"), (int, float)) and isinstance(sample.get("viewers"), int)
+    ]
+    peak = max((point["count"] for point in viewer_points), default=None)
+    recorded = None
+    if len(samples) >= 2 and isinstance(samples[0].get("t"), (int, float)) and isinstance(samples[-1].get("t"), (int, float)):
+        recorded = max(0, int(samples[-1]["t"] - samples[0]["t"]))
+    started = _last_int(samples, "started_at")
+    return {
+        "room_id": room.get("room_id") or "",
+        "display_id": room.get("display_id") or "",
+        "nickname": room.get("nickname") or "",
+        "web_path": room.get("web_path") or "",
+        "samples": [
+            {
+                "t": sample.get("t"),
+                "viewers": _kept_int(sample.get("viewers")),
+                "likes": _kept_int(sample.get("likes")),
+                "follows": _kept_int(sample.get("follows")),
+                "watched": _kept_int(sample.get("watched")),
+                "live": bool(sample.get("live")),
+            }
+            for sample in samples
+            if isinstance(sample.get("t"), (int, float))
+        ],
+        "viewer_segments": viewer_points,
+        "peak_viewers": peak,
+        "likes": _last_int(samples, "likes"),
+        "follows": _last_int(samples, "follows"),
+        "watched": _last_int(samples, "watched"),
+        "recorded_seconds": recorded,
+        "started_at": started,
+        "gifts": None,
+        "gift_reason": GIFT_SEGMENTS_UNAVAILABLE,
+        "average_online": None,
+        "average_online_reason": AVERAGE_ONLINE_UNAVAILABLE,
+        "average_stay_seconds": None,
+        "average_stay_reason": AVERAGE_STAY_UNAVAILABLE,
+        "today_followers": None,
+        "today_followers_reason": TODAY_FOLLOWERS_UNAVAILABLE,
+    }
+
+
+def month_index(store: dict[str, dict], month: str) -> dict[str, dict]:
+    found = {}
+    prefix = month + "-"
+    for day, rooms_on_day in store.items():
+        if not day.startswith(prefix) or not isinstance(rooms_on_day, dict):
+            continue
+        samples = 0
+        for room in rooms_on_day.values():
+            if isinstance(room, dict):
+                samples += len(room.get("samples") or [])
+        found[day] = {"rooms": len(rooms_on_day), "samples": samples}
+    return found
+
+
+def day_view(store: dict[str, dict], day: str) -> dict:
+    rooms_on_day = store.get(day) if isinstance(store.get(day), dict) else {}
+    rooms_out = [summarize_day_room(room) for room in rooms_on_day.values() if isinstance(room, dict)]
+    rooms_out.sort(key=lambda room: (-(room["peak_viewers"] or -1), room.get("nickname") or ""))
+    return {
+        "day": day,
+        "rooms": rooms_out,
+        "empty": not rooms_out,
+        "note": "只包含这台电脑上本程序刷新到的读数。关掉程序的时段不会补。礼物、整场平均在线和人均停留没有可靠来源，所以留空。",
+    }
+
+
+def remember_observation(item: dict, when: float | None = None) -> None:
+    moment = time.time() if when is None else when
+    with history_lock:
+        if not append_observation(daily_history, item, moment):
+            return
+        save_history_locked()
+
+
+def save_history_locked() -> None:
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "days": daily_history}
+    temporary = HISTORY_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(HISTORY_PATH)
+
+
+def load_history() -> None:
+    global daily_history
+    if not HISTORY_PATH.exists():
+        daily_history = {}
+        return
+    try:
+        payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        loaded = payload.get("days") if isinstance(payload, dict) else None
+        daily_history = loaded if isinstance(loaded, dict) else {}
+    except (OSError, json.JSONDecodeError) as error:
+        backup = HISTORY_PATH.with_suffix(".bad")
+        try:
+            HISTORY_PATH.replace(backup)
+        except OSError:
+            pass
+        daily_history = {}
+        log(f"日历记录无法读取，已忽略并备份：{error}")
+    with history_lock:
+        prune_history(daily_history)
+    hydrate_today()
+
+
+def hydrate_today() -> None:
+    day = local_day(time.time())
+    rooms_on_day = daily_history.get(day) if isinstance(daily_history.get(day), dict) else {}
+    by_room = {}
+    for room in rooms_on_day.values():
+        if isinstance(room, dict) and room.get("room_id"):
+            by_room[str(room["room_id"])] = room
+    for item in rooms:
+        saved = by_room.get(str(item.get("room_id") or ""))
+        if not saved:
+            continue
+        points = [
+            {"t": sample["t"], "count": sample["viewers"]}
+            for sample in saved.get("samples") or []
+            if isinstance(sample, dict) and isinstance(sample.get("t"), (int, float)) and isinstance(sample.get("viewers"), int)
+        ]
+        if points:
+            histories[item["id"]] = points[-HISTORY_LIMIT:]
+
+
 def state_payload() -> dict:
     with data_lock:
         return {
@@ -231,6 +463,7 @@ def apply_snapshot(item: dict, snap: dict) -> None:
         series = histories.setdefault(item["id"], [])
         series.append({"t": item["updated_at"], "count": item["viewer_count"]})
         del series[:-HISTORY_LIMIT]
+    remember_observation(item, item["updated_at"])
 
 
 def _duplicate(snap: dict) -> bool:
@@ -288,7 +521,9 @@ def add_room(query: str) -> dict:
         if item["live"] and isinstance(item["viewer_count"], int):
             histories[item["id"]] = [{"t": now, "count": item["viewer_count"]}]
         save_rooms()
-        return public_room(item)
+        created = public_room(item)
+    remember_observation(item, now)
+    return created
 
 
 def remove_room(room_key: str) -> bool:
@@ -590,6 +825,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self.send_json(200, state_payload())
             return
+        if path == "/api/history":
+            self._history(parsed)
+            return
         if path == "/api/search":
             keyword = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
             try:
@@ -621,6 +859,28 @@ class Handler(BaseHTTPRequestHandler):
             self._static(relative)
             return
         self.send_json(404, {"error": "没有这个地址"})
+
+    def _history(self, parsed) -> None:
+        query = urllib.parse.parse_qs(parsed.query)
+        month = query.get("month", [""])[0]
+        day = query.get("day", [""])[0]
+        with history_lock:
+            if len(month) == 7 and month[4] == "-" and month[:4].isdigit() and month[5:7].isdigit():
+                self.send_json(
+                    200,
+                    {
+                        "month": month,
+                        "today": local_day(time.time()),
+                        "days": month_index(daily_history, month),
+                        "retained_days": RETAIN_DAYS,
+                        "note": "按这台电脑的本地日期保存。一天里只列出本程序实际刷新到的房间。",
+                    },
+                )
+                return
+            if len(day) == 10 and day[4] == "-" and day[7] == "-" and day.replace("-", "").isdigit():
+                self.send_json(200, day_view(daily_history, day))
+                return
+        self.send_json(400, {"error": "需要 month=YYYY-MM 或 day=YYYY-MM-DD"})
 
     def _post(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -709,12 +969,14 @@ def main() -> None:
         sys.exit(run_check())
 
     load_rooms()
+    load_history()
     worker = threading.Thread(target=refresh_loop, name="refresh", daemon=True)
     worker.start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     shown_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     print(f"抖音直播在线人数已启动：http://{shown_host}:{args.port}")
     print(f"名单保存在 {DATA_PATH}")
+    print(f"日历记录保存在 {HISTORY_PATH}")
     print("按 Ctrl+C 停止")
     try:
         server.serve_forever()
