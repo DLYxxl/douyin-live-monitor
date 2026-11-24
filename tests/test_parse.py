@@ -219,6 +219,8 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(detail["session_follows"], 4)
         self.assertGreaterEqual(detail["live_seconds"], 120)
         self.assertEqual(detail["observed_peak"], 20)
+        kept = room_detail({"live": True, "observed_peak": 80, "viewer_count": 20}, [{"t": 1, "count": 10}])
+        self.assertEqual(kept["observed_peak"], 80)
         offline = room_detail({"live": False, "started_at": int(time.time()) - 500}, [])
         self.assertIsNone(offline["live_seconds"])
 

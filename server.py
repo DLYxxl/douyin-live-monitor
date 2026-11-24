@@ -146,6 +146,10 @@ def room_detail(item: dict, history: list[dict]) -> dict:
     counts = [point["count"] for point in history if isinstance(point.get("count"), int)]
     if isinstance(item.get("viewer_count"), int):
         counts.append(item["viewer_count"])
+    stored_peak = item.get("observed_peak")
+    peak = stored_peak if isinstance(stored_peak, int) else None
+    if counts:
+        peak = max(counts) if peak is None else max(peak, max(counts))
     follows = item.get("session_follows")
     likes = item.get("like_count")
     return {
@@ -159,7 +163,7 @@ def room_detail(item: dict, history: list[dict]) -> dict:
         "gift_reason": GIFT_SEGMENTS_UNAVAILABLE,
         "viewer_segments": history,
         "viewer_segments_note": VIEWER_SEGMENTS_NOTE,
-        "observed_peak": max(counts) if counts else None,
+        "observed_peak": peak,
     }
 
 
@@ -186,7 +190,7 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     new_room = str(snap.get("room_id") or "")
     if previous_room and new_room and previous_room != new_room:
         histories[item["id"]] = []
-        for field in ("started_at", "session_follows", "like_count"):
+        for field in ("started_at", "session_follows", "like_count", "observed_peak"):
             item.pop(field, None)
     for field in ("room_id", "display_id", "nickname", "avatar", "title", "web_path"):
         value = snap.get(field)
@@ -206,6 +210,10 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     for field in ("started_at", "session_follows", "like_count"):
         if snap.get(field) is not None:
             item[field] = snap[field]
+    if isinstance(item.get("viewer_count"), int):
+        previous_peak = item.get("observed_peak")
+        if not isinstance(previous_peak, int) or item["viewer_count"] > previous_peak:
+            item["observed_peak"] = item["viewer_count"]
     item["_offline_ticks"] = snap.get("_offline_ticks", item.get("_offline_ticks", 0))
     item["error"] = None
     item["updated_at"] = time.time()
@@ -256,6 +264,7 @@ def add_room(query: str) -> dict:
         "started_at": snap.get("started_at"),
         "session_follows": snap.get("session_follows"),
         "like_count": snap.get("like_count"),
+        "observed_peak": snap.get("viewer_count") if isinstance(snap.get("viewer_count"), int) else None,
         "error": None,
         "updated_at": now,
         "added_at": now,

@@ -389,14 +389,14 @@ function renderDetail(rooms) {
     grid.append(metricTile("直播时间", room.live ? "没有开播时间" : "当前没有进行中的直播", room.live ? "这次的房间数据里没有可用的 start_time。" : "未开播时不估算上一场时长。", true));
   }
   if (typeof detail.like_count === "number") {
-    grid.append(metricTile("点赞", formatNumber(detail.like_count), "来自公开房间上的 like_count。同一接口里 stats.like_count 一直是 0，没有采用。", false));
+    grid.append(metricTile("点赞数量", formatNumber(detail.like_count), "来自公开房间上的 like_count。同一接口里 stats.like_count 一直是 0，没有采用。", false));
   } else {
-    grid.append(metricTile("点赞", "这次没拿到", "房间数据里没有 like_count。", true));
+    grid.append(metricTile("点赞数量", "这次没拿到", "房间数据里没有 like_count。", true));
   }
   if (typeof detail.observed_peak === "number") {
-    grid.append(metricTile("本机看到的最高在线", formatNumber(detail.observed_peak), "只取这次打开后本机采样和当前人数里的最大值，不是抖音公布的整场峰值。", false));
+    grid.append(metricTile("峰值在线人数", formatNumber(detail.observed_peak), "公开接口里的 max_audience_cnt 在未登录时一直是 0，不能当成峰值。这里是本机刷新到的整数在线人数里的最大值，程序没开着的时段不会算进去。", false));
   } else {
-    grid.append(metricTile("本机看到的最高在线", "还没有采样", "加入名单并刷新到整数在线人数后才会有。", true));
+    grid.append(metricTile("峰值在线人数", "还没有整数采样", "要有一次成功刷新到的整数在线人数后才会显示。不把接口里的 0 当成峰值。", true));
   }
 
   const viewersBlock = document.createElement("section");
