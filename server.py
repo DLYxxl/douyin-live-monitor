@@ -12,21 +12,41 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from douyin import DouyinClient, DouyinLookupError, avatar_host_ok
+from douyin import (
+    AVERAGE_ONLINE_UNAVAILABLE,
+    AVERAGE_STAY_UNAVAILABLE,
+    GIFT_SEGMENTS_UNAVAILABLE,
+    SESSION_VIEWERS_NOTE,
+    TODAY_FOLLOWERS_UNAVAILABLE,
+    VIEWER_SEGMENTS_NOTE,
+    DouyinClient,
+    DouyinLookupError,
+    avatar_host_ok,
+    clean_query,
+    filter_catalog,
+    query_action,
+    search_note,
+)
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
 DATA_PATH = ROOT / "data" / "watchlist.json"
+HISTORY_PATH = ROOT / "data" / "history.json"
 MAX_ROOMS = 20
 DEFAULT_INTERVAL = 10
-HISTORY_LIMIT = 36
+HISTORY_LIMIT = 180
+MAX_DAY_SAMPLES = 1500
+RETAIN_DAYS = 120
 
 rooms: list[dict] = []
 histories: dict[str, list[dict]] = {}
+daily_history: dict[str, dict[str, dict]] = {}
 data_lock = threading.Lock()
+history_lock = threading.Lock()
 net_lock = threading.Lock()
 refresh_lock = threading.Lock()
 client = DouyinClient()
@@ -122,7 +142,289 @@ def public_room(item: dict) -> dict:
         "added_at": item.get("added_at"),
         "link": room_link(item),
         "history": history,
+        "detail": room_detail(item, history),
     }
+
+
+def room_detail(item: dict, history: list[dict]) -> dict:
+    now = time.time()
+    started = item.get("started_at")
+    live_seconds = None
+    if item.get("live") and isinstance(started, int) and 1_000_000_000 <= started <= now + 120:
+        live_seconds = max(0, int(now - started))
+    counts = [
+        point["count"]
+        for point in history
+        if isinstance(point.get("count"), int) and not point.get("approximate")
+    ]
+    if isinstance(item.get("viewer_count"), int) and not item.get("viewer_approximate"):
+        counts.append(item["viewer_count"])
+    stored_peak = item.get("observed_peak")
+    peak = stored_peak if isinstance(stored_peak, int) else None
+    if counts:
+        peak = max(counts) if peak is None else max(peak, max(counts))
+    follows = item.get("session_follows")
+    likes = item.get("like_count")
+    viewers = item.get("session_viewers")
+    return {
+        "started_at": started if isinstance(started, int) else None,
+        "live_seconds": live_seconds,
+        "session_follows": follows if isinstance(follows, int) else None,
+        "today_followers": None,
+        "today_followers_reason": TODAY_FOLLOWERS_UNAVAILABLE,
+        "like_count": likes if isinstance(likes, int) else None,
+        "session_viewers": viewers if isinstance(viewers, int) else None,
+        "session_viewers_note": SESSION_VIEWERS_NOTE,
+        "average_online": None,
+        "average_online_reason": AVERAGE_ONLINE_UNAVAILABLE,
+        "average_stay_seconds": None,
+        "average_stay_reason": AVERAGE_STAY_UNAVAILABLE,
+        "gift_segments": None,
+        "gift_reason": GIFT_SEGMENTS_UNAVAILABLE,
+        "viewer_segments": history,
+        "viewer_segments_note": VIEWER_SEGMENTS_NOTE,
+        "observed_peak": peak,
+    }
+
+
+def local_day(timestamp: float) -> str:
+    return time.strftime("%Y-%m-%d", time.localtime(timestamp))
+
+
+def _kept_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _thin_samples(samples: list[dict]) -> list[dict]:
+    """相邻两点合成一点时留下较高的在线人数，避免抽稀把峰值丢掉。"""
+    if len(samples) <= MAX_DAY_SAMPLES:
+        return samples
+    thinned: list[dict] = []
+    index = 0
+    while index < len(samples):
+        if index + 1 < len(samples):
+            first, second = samples[index], samples[index + 1]
+            counts = [value for value in (_kept_int(first.get("viewers")), _kept_int(second.get("viewers"))) if value is not None]
+            merged = dict(second)
+            if counts:
+                merged["viewers"] = max(counts)
+            thinned.append(merged)
+            index += 2
+        else:
+            thinned.append(samples[index])
+            index += 1
+    return thinned
+
+
+def prune_history(store: dict[str, dict], today: date | None = None) -> None:
+    anchor = today or datetime.now().astimezone().date()
+    cutoff = (anchor - timedelta(days=RETAIN_DAYS)).isoformat()
+    for day in list(store):
+        if day < cutoff:
+            del store[day]
+
+
+def append_observation(store: dict[str, dict], item: dict, when: float) -> bool:
+    """把一次真实读数归到本地日期。没有整数读数时不写。"""
+    viewers = _kept_int(item.get("viewer_count"))
+    likes = _kept_int(item.get("like_count"))
+    follows = _kept_int(item.get("session_follows"))
+    watched = _kept_int(item.get("session_viewers"))
+    if viewers is None and likes is None and follows is None and watched is None:
+        return False
+    room_key = str(item.get("room_id") or item.get("display_id") or item.get("nickname") or "")
+    if not room_key:
+        return False
+    sample = {
+        "t": when,
+        "viewers": viewers,
+        "likes": likes,
+        "follows": follows,
+        "watched": watched,
+        "live": bool(item.get("live")),
+        "started_at": _kept_int(item.get("started_at")),
+        "viewers_approximate": bool(viewers is not None and item.get("viewer_approximate")),
+    }
+    day = local_day(when)
+    rooms_on_day = store.setdefault(day, {})
+    room = rooms_on_day.get(room_key)
+    if room is None:
+        room = {
+            "room_id": str(item.get("room_id") or ""),
+            "display_id": str(item.get("display_id") or ""),
+            "nickname": str(item.get("nickname") or ""),
+            "web_path": str(item.get("web_path") or ""),
+            "samples": [],
+        }
+        rooms_on_day[room_key] = room
+    for field in ("room_id", "display_id", "nickname", "web_path"):
+        value = item.get(field)
+        if value:
+            room[field] = str(value)
+    samples: list[dict] = room["samples"]
+    if samples:
+        previous = samples[-1]
+        unchanged = all(
+            previous.get(key) == sample[key]
+            for key in ("viewers", "likes", "follows", "watched", "live", "viewers_approximate")
+        )
+        if unchanged and when - float(previous.get("t") or 0) < 15:
+            return False
+    samples.append(sample)
+    room["samples"] = _thin_samples(samples)
+    prune_history(store, datetime.fromtimestamp(when).astimezone().date())
+    return True
+
+
+def _last_int(samples: list[dict], key: str) -> int | None:
+    for sample in reversed(samples):
+        value = _kept_int(sample.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def summarize_day_room(room: dict) -> dict:
+    samples = [sample for sample in room.get("samples") or [] if isinstance(sample, dict)]
+    viewer_points = []
+    for sample in samples:
+        if not isinstance(sample.get("t"), (int, float)) or not isinstance(sample.get("viewers"), int):
+            continue
+        point = {"t": sample["t"], "count": sample["viewers"]}
+        if sample.get("viewers_approximate"):
+            point["approximate"] = True
+        viewer_points.append(point)
+    exact_counts = [point["count"] for point in viewer_points if not point.get("approximate")]
+    peak = max(exact_counts, default=None)
+    recorded = None
+    if len(samples) >= 2 and isinstance(samples[0].get("t"), (int, float)) and isinstance(samples[-1].get("t"), (int, float)):
+        recorded = max(0, int(samples[-1]["t"] - samples[0]["t"]))
+    started = _last_int(samples, "started_at")
+    return {
+        "room_id": room.get("room_id") or "",
+        "display_id": room.get("display_id") or "",
+        "nickname": room.get("nickname") or "",
+        "web_path": room.get("web_path") or "",
+        "samples": [
+            {
+                "t": sample.get("t"),
+                "viewers": _kept_int(sample.get("viewers")),
+                "likes": _kept_int(sample.get("likes")),
+                "follows": _kept_int(sample.get("follows")),
+                "watched": _kept_int(sample.get("watched")),
+                "live": bool(sample.get("live")),
+                "viewers_approximate": bool(sample.get("viewers_approximate")),
+            }
+            for sample in samples
+            if isinstance(sample.get("t"), (int, float))
+        ],
+        "viewer_segments": viewer_points,
+        "peak_viewers": peak,
+        "likes": _last_int(samples, "likes"),
+        "follows": _last_int(samples, "follows"),
+        "watched": _last_int(samples, "watched"),
+        "recorded_seconds": recorded,
+        "started_at": started,
+        "gifts": None,
+        "gift_reason": GIFT_SEGMENTS_UNAVAILABLE,
+        "average_online": None,
+        "average_online_reason": AVERAGE_ONLINE_UNAVAILABLE,
+        "average_stay_seconds": None,
+        "average_stay_reason": AVERAGE_STAY_UNAVAILABLE,
+        "today_followers": None,
+        "today_followers_reason": TODAY_FOLLOWERS_UNAVAILABLE,
+    }
+
+
+def month_index(store: dict[str, dict], month: str) -> dict[str, dict]:
+    found = {}
+    prefix = month + "-"
+    for day, rooms_on_day in store.items():
+        if not day.startswith(prefix) or not isinstance(rooms_on_day, dict):
+            continue
+        samples = 0
+        for room in rooms_on_day.values():
+            if isinstance(room, dict):
+                samples += len(room.get("samples") or [])
+        found[day] = {"rooms": len(rooms_on_day), "samples": samples}
+    return found
+
+
+def day_view(store: dict[str, dict], day: str) -> dict:
+    rooms_on_day = store.get(day) if isinstance(store.get(day), dict) else {}
+    rooms_out = [summarize_day_room(room) for room in rooms_on_day.values() if isinstance(room, dict)]
+    rooms_out.sort(key=lambda room: (-(room["peak_viewers"] or -1), room.get("nickname") or ""))
+    return {
+        "day": day,
+        "rooms": rooms_out,
+        "empty": not rooms_out,
+        "note": "只包含这台电脑上本程序刷新到的读数。关掉程序的时段不会补。礼物、整场平均在线和人均停留没有可靠来源，所以留空。",
+    }
+
+
+def remember_observation(item: dict, when: float | None = None) -> None:
+    moment = time.time() if when is None else when
+    with history_lock:
+        if not append_observation(daily_history, item, moment):
+            return
+        save_history_locked()
+
+
+def save_history_locked() -> None:
+    HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "days": daily_history}
+    temporary = HISTORY_PATH.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(HISTORY_PATH)
+
+
+def load_history() -> None:
+    global daily_history
+    if not HISTORY_PATH.exists():
+        daily_history = {}
+        return
+    try:
+        payload = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        loaded = payload.get("days") if isinstance(payload, dict) else None
+        daily_history = loaded if isinstance(loaded, dict) else {}
+    except (OSError, json.JSONDecodeError) as error:
+        backup = HISTORY_PATH.with_suffix(".bad")
+        try:
+            HISTORY_PATH.replace(backup)
+        except OSError:
+            pass
+        daily_history = {}
+        log(f"日历记录无法读取，已忽略并备份：{error}")
+    with history_lock:
+        prune_history(daily_history)
+    hydrate_today()
+
+
+def hydrate_today() -> None:
+    day = local_day(time.time())
+    rooms_on_day = daily_history.get(day) if isinstance(daily_history.get(day), dict) else {}
+    by_room = {}
+    for room in rooms_on_day.values():
+        if isinstance(room, dict) and room.get("room_id"):
+            by_room[str(room["room_id"])] = room
+    for item in rooms:
+        saved = by_room.get(str(item.get("room_id") or ""))
+        if not saved:
+            continue
+        points = []
+        for sample in saved.get("samples") or []:
+            if not isinstance(sample, dict) or not isinstance(sample.get("t"), (int, float)):
+                continue
+            if not isinstance(sample.get("viewers"), int):
+                continue
+            point = {"t": sample["t"], "count": sample["viewers"]}
+            if sample.get("viewers_approximate"):
+                point["approximate"] = True
+            points.append(point)
+        if points:
+            histories[item["id"]] = points[-HISTORY_LIMIT:]
 
 
 def state_payload() -> dict:
@@ -148,6 +450,8 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     new_room = str(snap.get("room_id") or "")
     if previous_room and new_room and previous_room != new_room:
         histories[item["id"]] = []
+        for field in ("started_at", "session_follows", "like_count", "session_viewers", "observed_peak"):
+            item.pop(field, None)
     for field in ("room_id", "display_id", "nickname", "avatar", "title", "web_path"):
         value = snap.get(field)
         if field == "web_path":
@@ -163,13 +467,24 @@ def apply_snapshot(item: dict, snap: dict) -> None:
     item["viewer_count"] = snap.get("viewer_count")
     item["viewer_approximate"] = bool(snap.get("viewer_approximate"))
     item["total_user"] = snap.get("total_user")
+    for field in ("started_at", "session_follows", "like_count", "session_viewers"):
+        if snap.get(field) is not None:
+            item[field] = snap[field]
+    if isinstance(item.get("viewer_count"), int) and not item.get("viewer_approximate"):
+        previous_peak = item.get("observed_peak")
+        if not isinstance(previous_peak, int) or item["viewer_count"] > previous_peak:
+            item["observed_peak"] = item["viewer_count"]
     item["_offline_ticks"] = snap.get("_offline_ticks", item.get("_offline_ticks", 0))
     item["error"] = None
     item["updated_at"] = time.time()
     if item["live"] and isinstance(item["viewer_count"], int):
         series = histories.setdefault(item["id"], [])
-        series.append({"t": item["updated_at"], "count": item["viewer_count"]})
+        point = {"t": item["updated_at"], "count": item["viewer_count"]}
+        if item.get("viewer_approximate"):
+            point["approximate"] = True
+        series.append(point)
         del series[:-HISTORY_LIMIT]
+    remember_observation(item, item["updated_at"])
 
 
 def _duplicate(snap: dict) -> bool:
@@ -210,6 +525,13 @@ def add_room(query: str) -> dict:
         "viewer_count": snap.get("viewer_count"),
         "viewer_approximate": bool(snap.get("viewer_approximate")),
         "total_user": snap.get("total_user"),
+        "started_at": snap.get("started_at"),
+        "session_follows": snap.get("session_follows"),
+        "like_count": snap.get("like_count"),
+        "session_viewers": snap.get("session_viewers"),
+        "observed_peak": snap.get("viewer_count")
+        if isinstance(snap.get("viewer_count"), int) and not snap.get("viewer_approximate")
+        else None,
         "error": None,
         "updated_at": now,
         "added_at": now,
@@ -220,9 +542,14 @@ def add_room(query: str) -> dict:
             raise DouyinLookupError("这个直播间已经在列表里")
         rooms.append(item)
         if item["live"] and isinstance(item["viewer_count"], int):
-            histories[item["id"]] = [{"t": now, "count": item["viewer_count"]}]
+            point = {"t": now, "count": item["viewer_count"]}
+            if item.get("viewer_approximate"):
+                point["approximate"] = True
+            histories[item["id"]] = [point]
         save_rooms()
-        return public_room(item)
+        created = public_room(item)
+    remember_observation(item, now)
+    return created
 
 
 def remove_room(room_key: str) -> bool:
@@ -308,15 +635,73 @@ _suggestion_cache: dict = {"at": 0.0, "rooms": []}
 _suggestion_lock = threading.Lock()
 
 
-def load_suggestions(fresh: bool = False) -> list[dict]:
+_catalog_cache: dict = {"at": 0.0, "rooms": []}
+_catalog_lock = threading.Lock()
+
+
+def load_name_catalog(fresh: bool = False) -> list[dict]:
+    now = time.time()
+    with _catalog_lock:
+        if not fresh and _catalog_cache["rooms"] and now - _catalog_cache["at"] < 40:
+            return list(_catalog_cache["rooms"])
+    with net_lock:
+        snaps = client.fetch_name_catalog()
+    with _catalog_lock:
+        _catalog_cache["at"] = time.time()
+        _catalog_cache["rooms"] = snaps
+    return list(snaps)
+
+
+def public_pick(snap: dict) -> dict:
+    return {
+        "room_id": snap.get("room_id") or "",
+        "display_id": snap.get("display_id") or "",
+        "web_path": snap.get("web_path") or snap.get("display_id") or "",
+        "nickname": snap.get("nickname") or "",
+        "avatar": snap.get("avatar") or "",
+        "avatar_urls": [url for url in (snap.get("avatar_urls") or []) if isinstance(url, str)][:3],
+        "title": snap.get("title") or "",
+        "live": bool(snap.get("live")),
+        "viewer_count": snap.get("viewer_count") if isinstance(snap.get("viewer_count"), int) else None,
+        "viewer_approximate": bool(snap.get("viewer_approximate")),
+        "link": room_link(snap),
+    }
+
+
+def search_by_name(keyword: str) -> dict:
+    text = clean_query(keyword)
+    action = query_action(text)
+    if action == "empty":
+        raise DouyinLookupError("请输入主播昵称")
+    if action == "direct":
+        raise DouyinLookupError("这是链接、房间号或抖音号，请直接点添加")
+    if len(text) > 30:
+        raise DouyinLookupError("名字太长了")
+    catalog = load_name_catalog()
+    if not catalog:
+        raise DouyinLookupError("这次没有从公开直播信息流拿到房间")
+    matched, total = filter_catalog(catalog, text)
+    return {
+        "query": text,
+        "scanned": len(catalog),
+        "total": total,
+        "rooms": [public_pick(snap) for snap in matched],
+        "note": search_note(len(catalog), total, len(matched)),
+        "error": None,
+    }
+
+
+def load_suggestions(fresh: bool = False) -> dict:
     now = time.time()
     with _suggestion_lock:
-        if not fresh and _suggestion_cache["rooms"] and now - _suggestion_cache["at"] < 45:
-            return list(_suggestion_cache["rooms"])
+        if not fresh and _suggestion_cache["rooms"] and now - _suggestion_cache["at"] < 60:
+            return {"rooms": list(_suggestion_cache["rooms"]), "note": _suggestion_cache.get("note") or ""}
     with net_lock:
-        snaps = client.suggestions()
+        ranked = client.hot_rank(limit=10)
     public = []
-    for snap in snaps:
+    for snap in ranked["rooms"]:
+        if not isinstance(snap.get("viewer_count"), int) or snap.get("viewer_approximate"):
+            continue
         public.append(
             {
                 "room_id": snap.get("room_id") or "",
@@ -333,7 +718,8 @@ def load_suggestions(fresh: bool = False) -> list[dict]:
     with _suggestion_lock:
         _suggestion_cache["at"] = time.time()
         _suggestion_cache["rooms"] = public
-    return public
+        _suggestion_cache["note"] = ranked["note"]
+    return {"rooms": public, "note": ranked["note"]}
 
 
 class _AvatarRedirect(urllib.request.HTTPRedirectHandler):
@@ -468,14 +854,26 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self.send_json(200, state_payload())
             return
+        if path == "/api/history":
+            self._history(parsed)
+            return
+        if path == "/api/search":
+            keyword = urllib.parse.parse_qs(parsed.query).get("q", [""])[0]
+            try:
+                payload = search_by_name(keyword)
+            except DouyinLookupError as error:
+                self.send_json(200, {"query": keyword, "rooms": [], "scanned": 0, "total": 0, "note": "", "error": error.message})
+                return
+            self.send_json(200, payload)
+            return
         if path == "/api/suggestions":
             fresh = urllib.parse.parse_qs(parsed.query).get("fresh", ["0"])[0] == "1"
             try:
-                rooms_out = load_suggestions(fresh=fresh)
+                ranked = load_suggestions(fresh=fresh)
             except DouyinLookupError as error:
-                self.send_json(200, {"rooms": [], "error": error.message})
+                self.send_json(200, {"rooms": [], "note": "", "error": error.message})
                 return
-            self.send_json(200, {"rooms": rooms_out, "error": None})
+            self.send_json(200, {"rooms": ranked["rooms"], "note": ranked["note"], "error": None})
             return
         if path == "/api/avatar":
             targets = urllib.parse.parse_qs(parsed.query).get("url", [])
@@ -490,6 +888,28 @@ class Handler(BaseHTTPRequestHandler):
             self._static(relative)
             return
         self.send_json(404, {"error": "没有这个地址"})
+
+    def _history(self, parsed) -> None:
+        query = urllib.parse.parse_qs(parsed.query)
+        month = query.get("month", [""])[0]
+        day = query.get("day", [""])[0]
+        with history_lock:
+            if len(month) == 7 and month[4] == "-" and month[:4].isdigit() and month[5:7].isdigit():
+                self.send_json(
+                    200,
+                    {
+                        "month": month,
+                        "today": local_day(time.time()),
+                        "days": month_index(daily_history, month),
+                        "retained_days": RETAIN_DAYS,
+                        "note": "按这台电脑的本地日期保存。一天里只列出本程序实际刷新到的房间。",
+                    },
+                )
+                return
+            if len(day) == 10 and day[4] == "-" and day[7] == "-" and day.replace("-", "").isdigit():
+                self.send_json(200, day_view(daily_history, day))
+                return
+        self.send_json(400, {"error": "需要 month=YYYY-MM 或 day=YYYY-MM-DD"})
 
     def _post(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -578,12 +998,14 @@ def main() -> None:
         sys.exit(run_check())
 
     load_rooms()
+    load_history()
     worker = threading.Thread(target=refresh_loop, name="refresh", daemon=True)
     worker.start()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     shown_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     print(f"抖音直播在线人数已启动：http://{shown_host}:{args.port}")
     print(f"名单保存在 {DATA_PATH}")
+    print(f"日历记录保存在 {HISTORY_PATH}")
     print("按 Ctrl+C 停止")
     try:
         server.serve_forever()

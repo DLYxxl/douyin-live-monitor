@@ -1,14 +1,23 @@
 import json
+import time
 import unittest
 
 from douyin import (
     DouyinLookupError,
+    _dedupe_ranked,
     avatar_host_ok,
+    classify_viewer_text,
+    filter_catalog,
     navigation_host_ok,
+    parse_category_cards,
     parse_count,
     parse_live_html,
     parse_query,
+    prepare_catalog_room,
+    query_action,
+    session_metrics,
 )
+from server import MAX_DAY_SAMPLES, append_observation, day_view, local_day, room_detail, _thin_samples
 from server import sort_rooms
 
 
@@ -115,6 +124,213 @@ class ParseTests(unittest.TestCase):
         self.assertFalse(navigation_host_ok("evil.douyin.com.example"))
         self.assertTrue(avatar_host_ok("p3.douyinpic.com"))
         self.assertFalse(avatar_host_ok("127.0.0.1"))
+
+    def test_name_query_stays_off_the_direct_add_path(self):
+        self.assertEqual(query_action("罗永浩"), "name")
+        self.assertEqual(query_action("  娟娟姐。"), "name")
+        self.assertEqual(query_action("@秋秋🎙️"), "name")
+        self.assertEqual(query_action("你好 世界"), "name")
+        self.assertEqual(query_action(""), "empty")
+        self.assertEqual(query_action("lisa"), "direct")
+        self.assertEqual(query_action("@menghuanyuanzi"), "direct")
+        self.assertEqual(query_action("7711811793449945890"), "direct")
+        self.assertEqual(query_action("https://live.douyin.com/EK17777777"), "direct")
+        self.assertEqual(query_action("https://example.com/123"), "direct")
+        self.assertEqual(parse_query("罗永浩"), {"mode": "web_path", "value": "罗永浩"})
+
+    def test_catalog_match_ranks_exact_name_before_a_busier_partial(self):
+        snaps = [
+            {"nickname": "小娟娟", "viewer_count": 5000, "room_id": "1"},
+            {"nickname": "娟娟", "viewer_count": 3, "room_id": "2"},
+            {"nickname": "别人", "viewer_count": 9, "room_id": "3"},
+            {"nickname": "娟娟姐", "viewer_count": 80, "room_id": "4"},
+            {"nickname": "", "viewer_count": 100, "room_id": "5"},
+        ]
+        matched, total = filter_catalog(snaps, "娟娟", limit=10)
+        self.assertEqual(total, 3)
+        self.assertEqual([item["nickname"] for item in matched], ["娟娟", "娟娟姐", "小娟娟"])
+        self.assertEqual(filter_catalog(snaps, "   ", limit=10), ([], 0))
+
+    def test_catalog_room_uses_audience_text_and_does_not_invent_a_count(self):
+        live = prepare_catalog_room(
+            {
+                "id_str": "7711843011574975232",
+                "status": 0,
+                "title": "伤感情歌",
+                "user_count": 589,
+                "owner": {
+                    "nickname": "秋秋",
+                    "display_id": "32930508987",
+                    "web_rid": "32089583401",
+                },
+                "room_view_stats": {
+                    "display_type": 1,
+                    "display_value": 589,
+                    "display_long": "589在线观众",
+                    "is_hidden": False,
+                },
+            }
+        )
+        self.assertTrue(live["live"])
+        self.assertEqual(live["viewer_count"], 589)
+        self.assertEqual(live["web_path"], "32930508987")
+        self.assertFalse(live["viewer_approximate"])
+        missing = prepare_catalog_room(
+            {
+                "id_str": "7711843011574975233",
+                "status": 0,
+                "title": "没给人数",
+                "owner": {"nickname": "没有人数"},
+            }
+        )
+        self.assertIsNone(missing["viewer_count"])
+        self.assertFalse(missing["live"])
+        self.assertIsNone(
+            prepare_catalog_room(
+                {"id_str": "1", "status": 4, "owner": {"nickname": "已结束"}, "user_count": 10}
+            )
+        )
+
+    def test_session_metrics_keep_follows_and_likes_but_not_zeroed_gifts(self):
+        metrics = session_metrics(
+            {
+                "start_time": 1795556003,
+                "like_count": 3251,
+                "stats": {"follow_count": 106, "like_count": 0, "gift_uv_count": 0, "fan_ticket": 0},
+            }
+        )
+        self.assertEqual(metrics["started_at"], 1795556003)
+        self.assertEqual(metrics["session_follows"], 106)
+        self.assertEqual(metrics["like_count"], 3251)
+        self.assertIsNone(metrics["gift_count"])
+        self.assertIsNone(metrics["session_viewers"])
+        watched = session_metrics(
+            {
+                "room_view_stats": {
+                    "display_type": 3,
+                    "display_value": 234998,
+                    "display_long": "23.5万人看过",
+                    "is_hidden": False,
+                },
+                "stats": {"total_user": 210400},
+            }
+        )
+        self.assertEqual(watched["session_viewers"], 234998)
+        online_only = session_metrics(
+            {
+                "room_view_stats": {
+                    "display_type": 1,
+                    "display_value": 105,
+                    "display_long": "105在线观众",
+                    "is_hidden": False,
+                },
+                "stats": {"total_user": 9999},
+            }
+        )
+        self.assertIsNone(online_only["session_viewers"])
+
+    def test_detail_does_not_invent_today_followers_or_gift_segments(self):
+        detail = room_detail(
+            {
+                "live": True,
+                "started_at": int(time.time()) - 125,
+                "session_follows": 4,
+                "like_count": 9,
+                "viewer_count": 20,
+            },
+            [{"t": 1, "count": 10}, {"t": 2, "count": 20}],
+        )
+        self.assertIsNone(detail["today_followers"])
+        self.assertIsNone(detail["gift_segments"])
+        self.assertIsNone(detail["average_online"])
+        self.assertIsNone(detail["average_stay_seconds"])
+        self.assertIn("平均在线", detail["average_online_reason"])
+        self.assertIn("停留", detail["average_stay_reason"])
+        self.assertIn("自然日", detail["today_followers_reason"])
+        self.assertIn("礼物", detail["gift_reason"])
+        self.assertEqual(detail["session_follows"], 4)
+        self.assertGreaterEqual(detail["live_seconds"], 120)
+        self.assertEqual(detail["observed_peak"], 20)
+        kept = room_detail({"live": True, "observed_peak": 80, "viewer_count": 20}, [{"t": 1, "count": 10}])
+        self.assertEqual(kept["observed_peak"], 80)
+        offline = room_detail({"live": False, "started_at": int(time.time()) - 500}, [])
+        self.assertIsNone(offline["live_seconds"])
+
+    def test_daily_history_keeps_recorded_numbers_only(self):
+        store = {}
+        start = time.time()
+        base = {"room_id": "1", "nickname": "甲", "display_id": "dy", "live": True, "started_at": int(start)}
+        self.assertTrue(
+            append_observation(
+                store,
+                {**base, "viewer_count": 3, "like_count": 1, "session_follows": 0, "session_viewers": 10},
+                start,
+            )
+        )
+        self.assertTrue(
+            append_observation(
+                store,
+                {**base, "viewer_count": 9, "like_count": 4, "session_follows": 1, "session_viewers": 12},
+                start + 20,
+            )
+        )
+        self.assertFalse(
+            append_observation(
+                store,
+                {**base, "viewer_count": 9, "like_count": 4, "session_follows": 1, "session_viewers": 12},
+                start + 25,
+            )
+        )
+        view = day_view(store, local_day(start))
+        room = view["rooms"][0]
+        self.assertEqual(room["peak_viewers"], 9)
+        self.assertEqual(room["likes"], 4)
+        self.assertEqual(room["follows"], 1)
+        self.assertEqual(room["watched"], 12)
+        self.assertIsNone(room["gifts"])
+        self.assertIsNone(room["average_online"])
+        self.assertIsNone(room["average_stay_seconds"])
+        self.assertIsNone(room["today_followers"])
+        self.assertTrue(day_view(store, "2000-01-01")["empty"])
+        crowded = [{"t": index, "viewers": 50 if index == 10 else 1, "likes": index} for index in range(MAX_DAY_SAMPLES + 1)]
+        thinned = _thin_samples(crowded)
+        self.assertLess(len(thinned), len(crowded))
+        self.assertEqual(max(sample["viewers"] for sample in thinned), 50)
+        marked = {}
+        self.assertTrue(
+            append_observation(
+                marked,
+                {**base, "viewer_count": 100, "viewer_approximate": True, "like_count": 1},
+                start + 80,
+            )
+        )
+        rough = day_view(marked, local_day(start))["rooms"][0]
+        self.assertTrue(rough["viewer_segments"][0]["approximate"])
+        self.assertIsNone(rough["peak_viewers"])
+
+    def test_hot_rank_uses_exact_counts_and_does_not_pad(self):
+        self.assertEqual(classify_viewer_text("8484"), ("exact", 8484))
+        self.assertEqual(classify_viewer_text("4万+"), ("lower", 40000))
+        self.assertEqual(classify_viewer_text("100+"), ("unknown", None))
+        html = (
+            'nickname\\":\\"$undefined '
+            'user_count_str\\":\\"4万+\\" nickname\\":\\"甲\\" web_rid\\":\\"111 '
+            'user_count_str\\":\\"900\\" nickname\\":\\"乙\\" web_rid\\":\\"222\\"'
+        )
+        cards = parse_category_cards(html)
+        self.assertEqual(cards[0]["nickname"], "甲")
+        self.assertEqual(cards[0]["count_text"], "4万+")
+        self.assertEqual(cards[1]["web_rid"], "222")
+        ranked = _dedupe_ranked(
+            [
+                {"room_id": "1", "viewer_count": 30, "viewer_approximate": False, "nickname": "低"},
+                {"room_id": "1", "viewer_count": 80, "viewer_approximate": False, "nickname": "高"},
+                {"room_id": "2", "viewer_count": 50, "viewer_approximate": True, "nickname": "约"},
+                {"room_id": "3", "viewer_count": 70, "viewer_approximate": False, "nickname": "中"},
+            ],
+            limit=10,
+        )
+        self.assertEqual([item["nickname"] for item in ranked], ["高", "中"])
 
     def test_sort_live_rooms_by_viewers(self):
         ordered = sort_rooms(

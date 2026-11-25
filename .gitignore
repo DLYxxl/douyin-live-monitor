@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 venv/
 data/watchlist.json
+data/history.json
 data/*.tmp
 data/*.bad

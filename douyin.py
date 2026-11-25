@@ -5,6 +5,7 @@
 
 - https://webcast.amemv.com/webcast/room/reflow/info/  按房间号读在线人数
 - https://live.douyin.com/webcast/feed/               公开信息流里正在直播的房间
+  首页热门卡片（source_key=web_homepage_hot_web_live_card）用来按昵称查找
 
 `aid=6383` 和 `app_id=1128` 是网页端公开客户端标识，不是密钥。
 """
@@ -17,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 USER_AGENT = (
@@ -27,6 +29,19 @@ USER_AGENT = (
 FEED_URL = (
     "https://live.douyin.com/webcast/feed/"
     "?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&channel=test&count=6"
+)
+# 首页热门直播卡片用的同一条公开信息流。不带登录态，一次大约二十个正在直播的房间。
+CATALOG_FEED_URL = (
+    "https://live.douyin.com/webcast/feed/"
+    "?aid=6383&app_name=douyin_web&live_id=1&device_platform=web&language=zh-CN"
+    "&channel=channel_pc_web&request_tag_from=web&need_map=1&liveid=1&is_draw=1"
+    "&inner_from_drawer=0&custom_count=50&action=load_more&action_type=loadmore"
+    "&enter_source=web_homepage_hot_web_live_card&source_key=web_homepage_hot_web_live_card"
+)
+NAME_SEARCH_NOTE = (
+    "按昵称在刚拉到的公开直播信息流里查找，不是全站用户搜索，也没有登录。"
+    "正在直播但没出现在这批房间里的人会找不到。同名会都列出来，需要你自己点选。"
+    "在线人数只用接口返回的整数，没有就不显示。"
 )
 REFLOW_URL = (
     "https://webcast.amemv.com/webcast/room/reflow/info/"
@@ -45,6 +60,7 @@ _AVATAR_SUFFIXES = (
     "bytegoofy.com",
 )
 _ID_RE = re.compile(r"^[\w.\-]{1,80}$", re.UNICODE)
+_ASCII_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _PACE_MARK = 'self.__pace_f.push([1,"'
 
 
@@ -91,14 +107,35 @@ def parse_count(value: object) -> int | None:
         return None
 
 
+def clean_query(raw: str) -> str:
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", raw or "")
+    return text.strip().strip("，。,.、；;\"'“”‘’")
+
+
+def query_action(raw: str) -> str:
+    """决定输入走原来的直接添加，还是按昵称搜索。
+
+    链接、16 位以上房间号、纯英文数字抖音号仍是直接添加。
+    含中文或其他字符的名字不能当作直播间路径，改走昵称搜索。
+    """
+    text = clean_query(raw)
+    if not text:
+        return "empty"
+    if "://" in text or "douyin.com" in text or "amemv.com" in text:
+        return "direct"
+    token = text[1:].strip() if text.startswith("@") else text
+    if _ASCII_ID_RE.match(token):
+        return "direct"
+    return "name"
+
+
 def parse_query(raw: str) -> dict[str, str]:
     """把用户输入分成房间号、直播间路径或短链。
 
     16 位及以上的纯数字视为一场直播的房间号（接口里的 room_id）。
     更短的纯数字、抖音号，视为 live.douyin.com 后面的那段路径。
     """
-    text = re.sub(r"[\u200b\u200c\u200d\ufeff]", "", raw or "")
-    text = text.strip().strip("，。,.、；;\"'“”‘’")
+    text = clean_query(raw)
     if not text:
         raise DouyinLookupError("请输入直播间链接、房间号或抖音号")
     if len(text) > 500:
@@ -286,6 +323,239 @@ def normalize_room(room: dict) -> dict:
     }
 
 
+TODAY_FOLLOWERS_UNAVAILABLE = (
+    "公开房间接口没有「自然日新增粉丝」。"
+    "stats.follow_count 只是这一场开播之后的新增关注，不能当成今天全天的新增。"
+)
+GIFT_SEGMENTS_UNAVAILABLE = (
+    "公开房间接口没有按时间段统计的礼物。"
+    "未登录时 gift_uv_count 和 fan_ticket 在正在直播、而且很热闹的房间里也一直是 0，不能把 0 显示成礼物数。"
+)
+AVERAGE_ONLINE_UNAVAILABLE = (
+    "公开房间接口没有这一场的平均在线人数。"
+    "本机只有每隔一会儿的采样，不能把这些点的平均数说成整场平均在线。"
+)
+AVERAGE_STAY_UNAVAILABLE = (
+    "公开房间接口没有人均停留时间。"
+    "用在线人数、场观和直播时长反推会是估算，这里不算。"
+)
+SESSION_VIEWERS_NOTE = (
+    "来自公开房间展示里的「人看过」整数（room_view_stats.display_value，且文案是人看过）。"
+    "stats.total_user 经常是另一个数，没有拿来顶替。这不是后台单独给出的去重名单。"
+)
+VIEWER_SEGMENTS_NOTE = (
+    "这些点是本机每次刷新记下的在线人数，按时间排开。"
+    "抖音这条公开接口不提供整场的人数分段，程序没开着的时段这里是空的。"
+)
+
+
+def _plain_int(value: object) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    return None
+
+
+def discover_category_ids(html: str) -> list[str]:
+    found = sorted(set(re.findall(r"/categorynew/(\d+_\d+)", html or "")))
+    return found or [f"4_{num}" for num in range(101, 109)]
+
+
+def classify_viewer_text(text: str) -> tuple[str, int | None]:
+    """公开页面上的人数字段。纯数字是整数；「万+」只是下界，不能当成精确人数。"""
+    raw = (text or "").strip()
+    if raw.isdigit():
+        return "exact", int(raw)
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)万\+", raw)
+    if not match:
+        return "unknown", None
+    return "lower", int(float(match.group(1)) * 10_000)
+
+
+def parse_category_cards(html: str) -> list[dict]:
+    """从分类页脚本里按出现顺序配上人数、昵称和 web_rid。"""
+    events: list[tuple[int, str, str]] = []
+    for match in re.finditer(r'user_count_str\\":\\"([^"\\]+)', html or ""):
+        events.append((match.start(), "count", match.group(1)))
+    for match in re.finditer(r'web_rid\\":\\"(\d+)', html or ""):
+        events.append((match.start(), "rid", match.group(1)))
+    for match in re.finditer(r'nickname\\":\\"([^"\\]{1,40})', html or ""):
+        events.append((match.start(), "nick", match.group(1)))
+    events.sort()
+    cards: list[dict] = []
+    index = 0
+    while index < len(events):
+        if events[index][1] != "count":
+            index += 1
+            continue
+        count_text = events[index][2]
+        nickname = ""
+        web_rid = ""
+        cursor = index + 1
+        while cursor < len(events) and events[cursor][1] != "count":
+            kind, value = events[cursor][1], events[cursor][2]
+            if kind == "nick" and not nickname and value != "$undefined":
+                nickname = value
+            elif kind == "rid" and not web_rid:
+                web_rid = value
+            cursor += 1
+        if web_rid and nickname:
+            cards.append({"web_rid": web_rid, "nickname": nickname, "count_text": count_text})
+        index = cursor
+    return cards
+
+
+def _exact_count_from_web_rid(web_rid: str) -> dict | None:
+    """打开公开直播页，只要页面里的整数在线人数。"""
+    client = DouyinClient()
+    try:
+        client.warm()
+        _status, _final, body = client._request(
+            f"https://live.douyin.com/{urllib.parse.quote(web_rid, safe='')}",
+            "text/html",
+            timeout=18,
+        )
+        snap = parse_live_html(body.decode("utf-8", "ignore"))
+    except DouyinLookupError:
+        return None
+    if not snap or not isinstance(snap.get("viewer_count"), int) or snap.get("viewer_approximate"):
+        return None
+    if not snap.get("web_path"):
+        snap["web_path"] = web_rid
+    return snap
+
+
+def _dedupe_ranked(snaps: list[dict], limit: int) -> list[dict]:
+    ordered = sorted(
+        (
+            snap
+            for snap in snaps
+            if isinstance(snap.get("viewer_count"), int) and not snap.get("viewer_approximate")
+        ),
+        key=lambda snap: snap["viewer_count"],
+        reverse=True,
+    )
+    seen: set[str] = set()
+    chosen: list[dict] = []
+    for snap in ordered:
+        keys = []
+        if snap.get("room_id"):
+            keys.append("id:" + str(snap["room_id"]))
+        if snap.get("web_path"):
+            keys.append("web:" + str(snap["web_path"]))
+        if snap.get("display_id"):
+            keys.append("dy:" + str(snap["display_id"]).lower())
+        if keys and any(key in seen for key in keys):
+            continue
+        seen.update(keys)
+        chosen.append(snap)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
+def session_metrics(room: dict) -> dict:
+    """从公开房间对象里取出能核对的场次数字。
+
+    礼物相关字段在未登录的 reflow 接口里对热门直播也恒为 0，0 不当作真实礼物数。
+    点赞用房间上的 like_count；stats.like_count 在这条接口里恒为 0。
+    """
+    if not isinstance(room, dict):
+        return {"started_at": None, "session_follows": None, "like_count": None, "session_viewers": None}
+    stats = room.get("stats") if isinstance(room.get("stats"), dict) else {}
+    started = _plain_int(room.get("start_time")) or _plain_int(room.get("create_time"))
+    if started is not None and started < 1_000_000_000:
+        started = None
+    gift_uv = _plain_int(stats.get("gift_uv_count"))
+    ticket = _plain_int(stats.get("fan_ticket"))
+    gift_count = gift_uv if gift_uv and gift_uv > 0 else None
+    if gift_count is None and ticket and ticket > 0:
+        gift_count = ticket
+    return {
+        "started_at": started,
+        "session_follows": _plain_int(stats.get("follow_count")),
+        "like_count": _plain_int(room.get("like_count")),
+        "gift_count": gift_count,
+        "session_viewers": _session_viewers(room),
+    }
+
+
+def _session_viewers(room: dict) -> int | None:
+    """只要公开文案写明「人看过」的那个整数。在线观众和 total_user 都不是这个数。"""
+    view = room.get("room_view_stats") if isinstance(room.get("room_view_stats"), dict) else {}
+    if not view or view.get("is_hidden"):
+        return None
+    if view.get("display_type") != 3:
+        return None
+    if "看过" not in str(view.get("display_long") or ""):
+        return None
+    value = view.get("display_value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and not value.is_integer():
+        return None
+    if int(value) < 0:
+        return None
+    return int(value)
+
+
+def _fold_name(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").casefold()
+
+
+def prepare_catalog_room(room: dict) -> dict | None:
+    """把首页信息流里的一间房整理成可展示的结果。
+
+    这条信息流里正在直播的房间，status 经常是 0，但 room_view_stats 会写「在线观众」。
+    只有看到这个展示文案或 status 为 2 时才标成开播，避免把没给人数的房间说成正在直播。
+    """
+    if not isinstance(room, dict) or room.get("status") == 4:
+        return None
+    snap = normalize_room(room)
+    if not snap.get("room_id") or not snap.get("nickname"):
+        return None
+    owner = room.get("owner") if isinstance(room.get("owner"), dict) else {}
+    if not snap.get("web_path"):
+        snap["web_path"] = str(owner.get("display_id") or owner.get("web_rid") or "")
+    view = room.get("room_view_stats") if isinstance(room.get("room_view_stats"), dict) else {}
+    audience = "在线" in str(view.get("display_long") or "")
+    if snap["status"] == 2 or (audience and isinstance(snap.get("viewer_count"), int)):
+        snap["live"] = True
+    return snap
+
+
+def filter_catalog(snaps: list[dict], keyword: str, limit: int = 12) -> tuple[list[dict], int]:
+    """按昵称包含关系筛选。完全相同优先，其次是开头相同，再按在线人数。"""
+    key = _fold_name(keyword)
+    if not key:
+        return [], 0
+    ranked: list[tuple] = []
+    for snap in snaps:
+        name = _fold_name(str(snap.get("nickname") or ""))
+        if not name or key not in name:
+            continue
+        if name == key:
+            tier = 0
+        elif name.startswith(key):
+            tier = 1
+        else:
+            tier = 2
+        viewers = snap.get("viewer_count")
+        viewer_rank = -viewers if isinstance(viewers, int) else 1
+        ranked.append((tier, viewer_rank, name, snap))
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]))
+    shown = [item[3] for item in ranked[: max(1, limit)]]
+    return shown, len(ranked)
+
+
+def search_note(scanned: int, total: int, shown: int) -> str:
+    extra = ""
+    if total > shown:
+        extra = f" 匹配到 {total} 个，这里只列出最接近的 {shown} 个。"
+    return f"在 {scanned} 个公开信息流房间里按昵称查找。{NAME_SEARCH_NOTE}{extra}"
+
+
 def _room_score(snap: dict) -> tuple:
     return (
         1 if snap.get("nickname") else 0,
@@ -394,6 +664,7 @@ class DouyinClient:
         if status_code not in (0, None) or not isinstance(room, dict) or not (room.get("id_str") or room.get("id")):
             raise DouyinLookupError("没有找到这个房间号")
         snap = normalize_room(room)
+        snap.update(session_metrics(room))
         if snap.get("display_id"):
             snap["web_path"] = snap["display_id"]
         return snap
@@ -425,6 +696,9 @@ class DouyinClient:
             if rich:
                 for field in ("nickname", "display_id", "avatar", "title"):
                     if rich.get(field):
+                        snap[field] = rich[field]
+                for field in ("started_at", "session_follows", "like_count", "gift_count", "session_viewers"):
+                    if rich.get(field) is not None:
                         snap[field] = rich[field]
                 snap["live"] = rich["live"]
                 snap["status"] = rich["status"]
@@ -490,6 +764,85 @@ class DouyinClient:
             return finish(self.fetch_by_room_id(room_id), ticks + 1)
         raise DouyinLookupError("缺少直播间标识，请删掉后重新添加")
 
+    def hot_rank(self, limit: int = 10) -> dict:
+        """在公开分类页和热门信息流里，按整数在线人数取最高的若干间。
+
+        不是抖音官方全站榜。只显示「万+」的房间会再打开直播页核对整数；
+        对不上整数的不列入，也不用约数凑满名额。
+        """
+        self.warm()
+        cards: list[dict] = []
+        try:
+            _status, _final, home = self._request("https://live.douyin.com/", "text/html", timeout=20)
+            category_ids = discover_category_ids(home.decode("utf-8", "ignore"))
+        except DouyinLookupError:
+            category_ids = [f"4_{num}" for num in range(101, 109)]
+        for category_id in category_ids[:8]:
+            try:
+                _status, _final, body = self._request(
+                    f"https://live.douyin.com/categorynew/{category_id}",
+                    "text/html",
+                    timeout=20,
+                )
+            except DouyinLookupError:
+                continue
+            cards.extend(parse_category_cards(body.decode("utf-8", "ignore")))
+            time.sleep(0.1)
+        try:
+            feed = self.fetch_name_catalog(pages=2)
+        except DouyinLookupError:
+            feed = []
+        exact: dict[str, dict] = {}
+        approximate: list[dict] = []
+        for card in cards:
+            kind, bound = classify_viewer_text(card.get("count_text") or "")
+            if kind == "exact" and bound is not None and card.get("web_rid"):
+                exact["web:" + card["web_rid"]] = {
+                    "room_id": "",
+                    "web_path": card["web_rid"],
+                    "display_id": "",
+                    "nickname": card.get("nickname") or "",
+                    "title": "",
+                    "avatar": "",
+                    "avatar_urls": [],
+                    "viewer_count": bound,
+                    "viewer_approximate": False,
+                    "live": True,
+                }
+            elif kind == "lower" and bound is not None and card.get("web_rid"):
+                approximate.append({**card, "lower": bound})
+        for snap in feed:
+            if (
+                snap.get("room_id")
+                and isinstance(snap.get("viewer_count"), int)
+                and not snap.get("viewer_approximate")
+            ):
+                exact["id:" + snap["room_id"]] = snap
+        ranked = sorted(exact.values(), key=lambda snap: snap["viewer_count"], reverse=True)
+        cutoff = ranked[limit - 1]["viewer_count"] if len(ranked) >= limit else 0
+        pending = [card for card in approximate if card["lower"] >= cutoff or len(ranked) < limit]
+        pending.sort(key=lambda card: card["lower"], reverse=True)
+        skipped = max(0, len(pending) - 24)
+        pending = pending[:24]
+        resolved = 0
+        if pending:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for snap in pool.map(_exact_count_from_web_rid, [card["web_rid"] for card in pending]):
+                    if not snap:
+                        continue
+                    resolved += 1
+                    key = "id:" + snap["room_id"] if snap.get("room_id") else "web:" + snap.get("web_path", "")
+                    exact[key] = snap
+        chosen = _dedupe_ranked(list(exact.values()), limit)
+        note = (
+            f"按这次公开分类页和热门信息流里能读到的整数在线人数排序，列出最高的 {len(chosen)} 个。"
+            "不是抖音官方全站榜。只写着「万+」的房间会再打开直播页换成整数；没有整数的不列入，也不用约数凑满 10 个。"
+            f"这次又核对了 {resolved} 个约数房间。"
+        )
+        if skipped:
+            note += f" 还有 {skipped} 个只显示约数的房间没有逐个打开，名单可能漏掉他们。"
+        return {"rooms": chosen, "note": note, "scanned": len(exact), "resolved": resolved}
+
     def suggestions(self, pages: int = 3) -> list[dict]:
         """从公开直播信息流取一批正在开播的房间，按在线人数从高到低。"""
         self.warm()
@@ -525,3 +878,38 @@ class DouyinClient:
             key=lambda snap: snap["viewer_count"] if snap["viewer_count"] is not None else -1,
             reverse=True,
         )
+
+    def fetch_name_catalog(self, pages: int = 3) -> list[dict]:
+        """拉取首页公开热门直播，供按昵称本地筛选。不访问需要登录的搜索接口。"""
+        self.warm()
+        found: dict[str, dict] = {}
+        maxtime = 0
+        page_count = max(1, min(pages, 4))
+        for index in range(page_count):
+            url = CATALOG_FEED_URL + f"&maxtime={int(maxtime)}"
+            try:
+                data = self._json(url)
+            except DouyinLookupError:
+                if found:
+                    break
+                raise
+            if data.get("status_code") not in (0, None):
+                if found:
+                    break
+                raise DouyinLookupError("昵称搜索暂时不可用")
+            items = data.get("data") if isinstance(data.get("data"), list) else []
+            for item in items:
+                room = item.get("data") if isinstance(item, dict) else None
+                if not isinstance(room, dict):
+                    continue
+                snap = prepare_catalog_room(room)
+                if snap is None:
+                    continue
+                found[snap["room_id"]] = snap
+            extra = data.get("extra") if isinstance(data.get("extra"), dict) else {}
+            maxtime = extra.get("max_time") or 0
+            if not extra.get("has_more") or not maxtime:
+                break
+            if index + 1 < page_count:
+                time.sleep(0.25)
+        return list(found.values())
