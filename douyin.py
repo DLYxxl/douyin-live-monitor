@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 USER_AGENT = (
@@ -356,6 +357,104 @@ def _plain_int(value: object) -> int | None:
     return None
 
 
+def discover_category_ids(html: str) -> list[str]:
+    found = sorted(set(re.findall(r"/categorynew/(\d+_\d+)", html or "")))
+    return found or [f"4_{num}" for num in range(101, 109)]
+
+
+def classify_viewer_text(text: str) -> tuple[str, int | None]:
+    """公开页面上的人数字段。纯数字是整数；「万+」只是下界，不能当成精确人数。"""
+    raw = (text or "").strip()
+    if raw.isdigit():
+        return "exact", int(raw)
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)万\+", raw)
+    if not match:
+        return "unknown", None
+    return "lower", int(float(match.group(1)) * 10_000)
+
+
+def parse_category_cards(html: str) -> list[dict]:
+    """从分类页脚本里按出现顺序配上人数、昵称和 web_rid。"""
+    events: list[tuple[int, str, str]] = []
+    for match in re.finditer(r'user_count_str\\":\\"([^"\\]+)', html or ""):
+        events.append((match.start(), "count", match.group(1)))
+    for match in re.finditer(r'web_rid\\":\\"(\d+)', html or ""):
+        events.append((match.start(), "rid", match.group(1)))
+    for match in re.finditer(r'nickname\\":\\"([^"\\]{1,40})', html or ""):
+        events.append((match.start(), "nick", match.group(1)))
+    events.sort()
+    cards: list[dict] = []
+    index = 0
+    while index < len(events):
+        if events[index][1] != "count":
+            index += 1
+            continue
+        count_text = events[index][2]
+        nickname = ""
+        web_rid = ""
+        cursor = index + 1
+        while cursor < len(events) and events[cursor][1] != "count":
+            kind, value = events[cursor][1], events[cursor][2]
+            if kind == "nick" and not nickname and value != "$undefined":
+                nickname = value
+            elif kind == "rid" and not web_rid:
+                web_rid = value
+            cursor += 1
+        if web_rid and nickname:
+            cards.append({"web_rid": web_rid, "nickname": nickname, "count_text": count_text})
+        index = cursor
+    return cards
+
+
+def _exact_count_from_web_rid(web_rid: str) -> dict | None:
+    """打开公开直播页，只要页面里的整数在线人数。"""
+    client = DouyinClient()
+    try:
+        client.warm()
+        _status, _final, body = client._request(
+            f"https://live.douyin.com/{urllib.parse.quote(web_rid, safe='')}",
+            "text/html",
+            timeout=18,
+        )
+        snap = parse_live_html(body.decode("utf-8", "ignore"))
+    except DouyinLookupError:
+        return None
+    if not snap or not isinstance(snap.get("viewer_count"), int) or snap.get("viewer_approximate"):
+        return None
+    if not snap.get("web_path"):
+        snap["web_path"] = web_rid
+    return snap
+
+
+def _dedupe_ranked(snaps: list[dict], limit: int) -> list[dict]:
+    ordered = sorted(
+        (
+            snap
+            for snap in snaps
+            if isinstance(snap.get("viewer_count"), int) and not snap.get("viewer_approximate")
+        ),
+        key=lambda snap: snap["viewer_count"],
+        reverse=True,
+    )
+    seen: set[str] = set()
+    chosen: list[dict] = []
+    for snap in ordered:
+        keys = []
+        if snap.get("room_id"):
+            keys.append("id:" + str(snap["room_id"]))
+        if snap.get("web_path"):
+            keys.append("web:" + str(snap["web_path"]))
+        if snap.get("display_id"):
+            keys.append("dy:" + str(snap["display_id"]).lower())
+        if keys and any(key in seen for key in keys):
+            continue
+        seen.update(keys)
+        chosen.append(snap)
+        if len(chosen) >= limit:
+            break
+    return chosen
+
+
 def session_metrics(room: dict) -> dict:
     """从公开房间对象里取出能核对的场次数字。
 
@@ -664,6 +763,85 @@ class DouyinClient:
         if room_id:
             return finish(self.fetch_by_room_id(room_id), ticks + 1)
         raise DouyinLookupError("缺少直播间标识，请删掉后重新添加")
+
+    def hot_rank(self, limit: int = 10) -> dict:
+        """在公开分类页和热门信息流里，按整数在线人数取最高的若干间。
+
+        不是抖音官方全站榜。只显示「万+」的房间会再打开直播页核对整数；
+        对不上整数的不列入，也不用约数凑满名额。
+        """
+        self.warm()
+        cards: list[dict] = []
+        try:
+            _status, _final, home = self._request("https://live.douyin.com/", "text/html", timeout=20)
+            category_ids = discover_category_ids(home.decode("utf-8", "ignore"))
+        except DouyinLookupError:
+            category_ids = [f"4_{num}" for num in range(101, 109)]
+        for category_id in category_ids[:8]:
+            try:
+                _status, _final, body = self._request(
+                    f"https://live.douyin.com/categorynew/{category_id}",
+                    "text/html",
+                    timeout=20,
+                )
+            except DouyinLookupError:
+                continue
+            cards.extend(parse_category_cards(body.decode("utf-8", "ignore")))
+            time.sleep(0.1)
+        try:
+            feed = self.fetch_name_catalog(pages=2)
+        except DouyinLookupError:
+            feed = []
+        exact: dict[str, dict] = {}
+        approximate: list[dict] = []
+        for card in cards:
+            kind, bound = classify_viewer_text(card.get("count_text") or "")
+            if kind == "exact" and bound is not None and card.get("web_rid"):
+                exact["web:" + card["web_rid"]] = {
+                    "room_id": "",
+                    "web_path": card["web_rid"],
+                    "display_id": "",
+                    "nickname": card.get("nickname") or "",
+                    "title": "",
+                    "avatar": "",
+                    "avatar_urls": [],
+                    "viewer_count": bound,
+                    "viewer_approximate": False,
+                    "live": True,
+                }
+            elif kind == "lower" and bound is not None and card.get("web_rid"):
+                approximate.append({**card, "lower": bound})
+        for snap in feed:
+            if (
+                snap.get("room_id")
+                and isinstance(snap.get("viewer_count"), int)
+                and not snap.get("viewer_approximate")
+            ):
+                exact["id:" + snap["room_id"]] = snap
+        ranked = sorted(exact.values(), key=lambda snap: snap["viewer_count"], reverse=True)
+        cutoff = ranked[limit - 1]["viewer_count"] if len(ranked) >= limit else 0
+        pending = [card for card in approximate if card["lower"] >= cutoff or len(ranked) < limit]
+        pending.sort(key=lambda card: card["lower"], reverse=True)
+        skipped = max(0, len(pending) - 24)
+        pending = pending[:24]
+        resolved = 0
+        if pending:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                for snap in pool.map(_exact_count_from_web_rid, [card["web_rid"] for card in pending]):
+                    if not snap:
+                        continue
+                    resolved += 1
+                    key = "id:" + snap["room_id"] if snap.get("room_id") else "web:" + snap.get("web_path", "")
+                    exact[key] = snap
+        chosen = _dedupe_ranked(list(exact.values()), limit)
+        note = (
+            f"按这次公开分类页和热门信息流里能读到的整数在线人数排序，列出最高的 {len(chosen)} 个。"
+            "不是抖音官方全站榜。只写着「万+」的房间会再打开直播页换成整数；没有整数的不列入，也不用约数凑满 10 个。"
+            f"这次又核对了 {resolved} 个约数房间。"
+        )
+        if skipped:
+            note += f" 还有 {skipped} 个只显示约数的房间没有逐个打开，名单可能漏掉他们。"
+        return {"rooms": chosen, "note": note, "scanned": len(exact), "resolved": resolved}
 
     def suggestions(self, pages: int = 3) -> list[dict]:
         """从公开直播信息流取一批正在开播的房间，按在线人数从高到低。"""

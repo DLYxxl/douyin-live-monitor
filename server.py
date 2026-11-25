@@ -691,15 +691,17 @@ def search_by_name(keyword: str) -> dict:
     }
 
 
-def load_suggestions(fresh: bool = False) -> list[dict]:
+def load_suggestions(fresh: bool = False) -> dict:
     now = time.time()
     with _suggestion_lock:
-        if not fresh and _suggestion_cache["rooms"] and now - _suggestion_cache["at"] < 45:
-            return list(_suggestion_cache["rooms"])
+        if not fresh and _suggestion_cache["rooms"] and now - _suggestion_cache["at"] < 60:
+            return {"rooms": list(_suggestion_cache["rooms"]), "note": _suggestion_cache.get("note") or ""}
     with net_lock:
-        snaps = client.suggestions()
+        ranked = client.hot_rank(limit=10)
     public = []
-    for snap in snaps:
+    for snap in ranked["rooms"]:
+        if not isinstance(snap.get("viewer_count"), int) or snap.get("viewer_approximate"):
+            continue
         public.append(
             {
                 "room_id": snap.get("room_id") or "",
@@ -716,7 +718,8 @@ def load_suggestions(fresh: bool = False) -> list[dict]:
     with _suggestion_lock:
         _suggestion_cache["at"] = time.time()
         _suggestion_cache["rooms"] = public
-    return public
+        _suggestion_cache["note"] = ranked["note"]
+    return {"rooms": public, "note": ranked["note"]}
 
 
 class _AvatarRedirect(urllib.request.HTTPRedirectHandler):
@@ -866,11 +869,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/suggestions":
             fresh = urllib.parse.parse_qs(parsed.query).get("fresh", ["0"])[0] == "1"
             try:
-                rooms_out = load_suggestions(fresh=fresh)
+                ranked = load_suggestions(fresh=fresh)
             except DouyinLookupError as error:
-                self.send_json(200, {"rooms": [], "error": error.message})
+                self.send_json(200, {"rooms": [], "note": "", "error": error.message})
                 return
-            self.send_json(200, {"rooms": rooms_out, "error": None})
+            self.send_json(200, {"rooms": ranked["rooms"], "note": ranked["note"], "error": None})
             return
         if path == "/api/avatar":
             targets = urllib.parse.parse_qs(parsed.query).get("url", [])

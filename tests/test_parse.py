@@ -4,9 +4,12 @@ import unittest
 
 from douyin import (
     DouyinLookupError,
+    _dedupe_ranked,
     avatar_host_ok,
+    classify_viewer_text,
     filter_catalog,
     navigation_host_ok,
+    parse_category_cards,
     parse_count,
     parse_live_html,
     parse_query,
@@ -304,6 +307,30 @@ class ParseTests(unittest.TestCase):
         rough = day_view(marked, local_day(start))["rooms"][0]
         self.assertTrue(rough["viewer_segments"][0]["approximate"])
         self.assertIsNone(rough["peak_viewers"])
+
+    def test_hot_rank_uses_exact_counts_and_does_not_pad(self):
+        self.assertEqual(classify_viewer_text("8484"), ("exact", 8484))
+        self.assertEqual(classify_viewer_text("4万+"), ("lower", 40000))
+        self.assertEqual(classify_viewer_text("100+"), ("unknown", None))
+        html = (
+            'nickname\\":\\"$undefined '
+            'user_count_str\\":\\"4万+\\" nickname\\":\\"甲\\" web_rid\\":\\"111 '
+            'user_count_str\\":\\"900\\" nickname\\":\\"乙\\" web_rid\\":\\"222\\"'
+        )
+        cards = parse_category_cards(html)
+        self.assertEqual(cards[0]["nickname"], "甲")
+        self.assertEqual(cards[0]["count_text"], "4万+")
+        self.assertEqual(cards[1]["web_rid"], "222")
+        ranked = _dedupe_ranked(
+            [
+                {"room_id": "1", "viewer_count": 30, "viewer_approximate": False, "nickname": "低"},
+                {"room_id": "1", "viewer_count": 80, "viewer_approximate": False, "nickname": "高"},
+                {"room_id": "2", "viewer_count": 50, "viewer_approximate": True, "nickname": "约"},
+                {"room_id": "3", "viewer_count": 70, "viewer_approximate": False, "nickname": "中"},
+            ],
+            limit=10,
+        )
+        self.assertEqual([item["nickname"] for item in ranked], ["高", "中"])
 
     def test_sort_live_rooms_by_viewers(self):
         ordered = sort_rooms(

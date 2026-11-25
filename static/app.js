@@ -20,6 +20,7 @@ let latestRooms = [];
 let suggestions = [];
 let suggestionsOpen = false;
 let suggestionsError = "";
+let suggestionsNote = "";
 let suggestionsLoading = false;
 let nameSearchOpen = false;
 let nameSearchLoading = false;
@@ -678,7 +679,7 @@ function renderSuggestions() {
   suggestionsEl.replaceChildren();
   const header = document.createElement("header");
   const title = document.createElement("h2");
-  title.textContent = "正在热播";
+  title.textContent = "在线人数较高";
   const close = document.createElement("button");
   close.type = "button";
   close.className = "ghost";
@@ -692,7 +693,7 @@ function renderSuggestions() {
   const note = document.createElement("p");
   note.className = "suggest-note";
   if (suggestionsLoading) {
-    note.textContent = "正在读取公开热播列表…";
+    note.textContent = "正在从公开分类页和热门信息流核对整数在线人数，可能要一会儿…";
     suggestionsEl.append(note);
     return;
   }
@@ -706,7 +707,7 @@ function renderSuggestions() {
     suggestionsEl.append(note);
     return;
   }
-  note.textContent = "来自抖音公开直播信息流，不是完整榜单。点添加后会再查一次这个房间的实时人数。";
+  note.textContent = suggestionsNote || "按这次能读到的公开房间整数在线人数排序，不是抖音官方全站榜。点添加后会再查一次这个房间。";
   const list = document.createElement("div");
   list.className = "suggest-list";
   suggestions.forEach((suggestion) => {
@@ -846,6 +847,7 @@ async function loadSuggestions(fresh) {
   try {
     const data = await api("/api/suggestions" + (fresh ? "?fresh=1" : ""));
     suggestions = data.rooms || [];
+    suggestionsNote = data.note || "";
     suggestionsError = data.error || "";
   } catch (error) {
     suggestions = [];
